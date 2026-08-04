@@ -79,6 +79,8 @@ namespace IngameScript
         double _cfgGyroRateCap = OrientationController.CommandedRateCapBase;
         double _cfgArrivalDist = -1.0;
         double _cfgGyroTorque;   // 0 = measure it
+        double _tackDeg = 30.0;  // cant used by the tack command
+        double _tackBias;        // default bias when the tack argument omits one
         bool _pendingGoto;
 
         string _lastCustomData = "\u0000";   // force a parse on the first run
@@ -304,19 +306,27 @@ namespace IngameScript
             switch (verb)
             {
                 case "goto":
-                    if (rest.Length > 0)
+                case "tack":
                     {
-                        Vector3D c;
-                        if (!TryParseDestination(rest, out c)) { _fault = "goto: bad coordinate"; return; }
-                        _targetCoord = c;
-                        _targetName = DestinationName(rest);
-                        _hasTarget = true;
+                        // tack flies the identical route; it only holds the drive off the track so
+                        // Spectrum's drive lobe never points down it. See QtrtController.TackAngleRad.
+                        QtrtController.TackAngleRad = verb == "tack" ? _tackDeg * Math.PI / 180.0 : 0.0;
+                        if (verb == "tack") QtrtController.TackBias = StripTackBias(ref rest);
+                        if (rest.Length > 0)
+                        {
+                            Vector3D c;
+                            if (!TryParseDestination(rest, out c)) { _fault = verb + ": bad coordinate"; return; }
+                            _targetCoord = c;
+                            _targetName = DestinationName(rest);
+                            _hasTarget = true;
+                        }
+                        if (!_hasTarget) { _fault = verb + ": no target set"; return; }
+                        EngageGoto();
+                        break;
                     }
-                    if (!_hasTarget) { _fault = "goto: no target set"; return; }
-                    EngageGoto();
-                    break;
                 case "route":
                     {
+                        QtrtController.TackAngleRad = 0.0;
                         if (rest.Length == 0) { _fault = "route: no waypoints"; return; }
                         WaypointEntry[] wps;
                         string err;
@@ -652,6 +662,23 @@ namespace IngameScript
                         if (TryParseI(val, out ss) && ss >= 8 && ss <= 64)
                             QtrtController.SamplesPerSegment = ss;
                         break;
+                    case "tackangle":
+                        // Cant used by the tack command. Past ~45 the emission lobe is already flat
+                        // and the propellant curve is not, so the useful band is narrow.
+                        double td;
+                        if (TryParseD(val, out td) && td >= 0.0 && td <= 60.0)
+                            _tackDeg = td;
+                        break;
+                    case "tackcone":
+                        double tc;
+                        if (TryParseD(val, out tc) && tc >= 5.0)
+                            QtrtController.TackConeSeconds = tc;
+                        break;
+                    case "tackbias":
+                        double tb;
+                        if (TryParseD(val, out tb) && tb >= 0.0 && tb <= 1.0)
+                            _tackBias = tb;
+                        break;
                 }
             }
 
@@ -801,6 +828,34 @@ namespace IngameScript
             if (_lastRunMs > _peakRunMs) { _peakRunMs = _lastRunMs; _peakTag = _prevTag; }
         }
 
+        // Fraction of the straight-line drive detection range retained at a given cant. From
+        // Spectrum's DirectionalEmission lobe: modifier is gain^2 inside the 3 deg cone and falls as
+        // sec^2(base - theta) to unity at acos(1/gain) + 3 deg. Range goes as sqrt(modifier).
+        static double TackRangeMult(double deg)
+        {
+            const double gain = 4.0, lobeDeg = 3.0;
+            double baseDeg = Math.Acos(1.0 / gain) * 180.0 / Math.PI + lobeDeg;
+            double m = deg <= lobeDeg ? gain
+                     : deg >= baseDeg ? 1.0
+                     : 1.0 / Math.Cos((baseDeg - deg) * Math.PI / 180.0);
+            return m / gain;
+        }
+
+        // Rough INDEX of how much sky the cant lights relative to a fixed pencil, not a measured
+        // integral. A cone at `deg` sweeps a band +/-18.5 deg wide (where the range multiplier is
+        // still 2x); bias narrows the dwell toward one azimuth, so the index is faded linearly to 1.
+        static double TackSweptSolid(double deg, double bias)
+        {
+            const double halfDeg = 18.52, rad = Math.PI / 180.0;
+            double pencil = 1.0 - Math.Cos(halfDeg * rad);
+            if (pencil < 1e-9) return 1.0;
+            double lo = Math.Abs(deg - halfDeg) * rad;
+            double hi = Math.Min(180.0, deg + halfDeg) * rad;
+            double band = (Math.Cos(lo) - Math.Cos(hi)) / pencil;
+            if (band < 1.0) band = 1.0;
+            return 1.0 + (band - 1.0) * (1.0 - MathHelper.Clamp(bias, 0.0, 1.0));
+        }
+
         string BuildEcho()
         {
             double frac = Runtime.MaxInstructionCount > 0
@@ -831,6 +886,16 @@ namespace IngameScript
                          .Append(" cross ").Append(q.DbgCross.ToString("0", Inv)).Append("m\n");
                 }
             }
+            if (QtrtController.TackAngleRad > 1e-6)
+                e.Append("TACK ").Append(_tackDeg.ToString("0", Inv))
+                 .Append(" deg bias ").Append(QtrtController.TackBias.ToString("0.00", Inv))
+                 .Append("  (-")
+                 .Append((100.0 - 100.0 * TackRangeMult(_tackDeg)).ToString("0", Inv))
+                 .Append("% lit range, +")
+                 .Append((100.0 / QtrtController.TackCos - 100.0).ToString("0", Inv))
+                 .Append("% burn, ")
+                 .Append(TackSweptSolid(_tackDeg, QtrtController.TackBias).ToString("0.0", Inv))
+                 .Append("x sky)\n");
             if (_state == ApState.Calibrate && _cal != null)
                 e.Append("calibrating: ").Append(_cal.Progress()).Append('\n');
             if (_align.Mode != RotationMode.None)
@@ -990,6 +1055,22 @@ namespace IngameScript
         // Ahead is the CONTROLLER's forward -- where the pilot is looking -- not IShip.Forward, which
         // is the max-thrust axis and can be up/down on a lander. Falls back to the drive axis only
         // when no controller is live. Suffixes: m (default) and km.
+        // Peel an optional trailing "0..1" bias off a tack argument, leaving the destination in `rest`.
+        // Splits on the LAST space and only commits if what remains still parses as a destination, so
+        // a GPS string with spaces in its name is never chopped. Returns 0 (symmetric) when absent.
+        double StripTackBias(ref string rest)
+        {
+            int sp = rest.LastIndexOf(' ');
+            if (sp <= 0) return _tackBias;
+            double b;
+            if (!TryParseD(rest.Substring(sp + 1).Trim(), out b) || b < 0.0 || b > 1.0) return _tackBias;
+            string head = rest.Substring(0, sp).Trim();
+            Vector3D probe;
+            if (head.Length == 0 || !TryParseDestination(head, out probe)) return _tackBias;
+            rest = head;
+            return b;
+        }
+
         bool TryParseDestination(string s, out Vector3D v)
         {
             v = Vector3D.Zero;

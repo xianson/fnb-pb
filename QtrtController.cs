@@ -156,6 +156,34 @@ namespace IngameScript
             public static double LaunchAlignRad = 0.20;
             public static double LaunchAlignMaxGravFrac = 0.05;
 
+            // ---- TACK: drive-signature obfuscation ------------------------------------
+            // Spectrum's drive emission is a directional lobe (3 deg half-angle, gain 4) welded to a
+            // cardinal hull face, so range is 4x inside it. A straight flip-and-burn therefore aims a
+            // 4x searchlight down the track: at the origin while accelerating, at the destination
+            // while braking. Holding the drive off the track keeps the lobe off both.
+            // 0 = off. 30 deg is the knee: 2.65x less range for 15.5% more propellant.
+            public static double TackAngleRad = 0.0;
+            // Coning period. The cant AZIMUTH rolls at a constant rate rather than flipping sign, so
+            // the lobe never sweeps back through the track, and lateral velocity is mean-zero by
+            // construction instead of needing a cancellation schedule.
+            public static double TackConeSeconds = 60.0;
+            // 0 = full cone, 1 = fixed azimuth. THIS IS AN EXPOSURE TRADE, NOT JUST AN EFFICIENCY ONE.
+            // A cone keeps lateral velocity mean-zero for free, but the swept lobe lights ~6x the
+            // solid angle a fixed pencil does -- it protects the on-track observer by broadcasting to
+            // an annulus a straight burn never touches. A fixed azimuth stays a pencil and also bows
+            // the track (which is what fools an observer who INTEGRATES the picture rather than
+            // sampling it), paid for in lateral velocity the cross-track loop has to fight.
+            public static double TackBias = 0.0;
+            // rad/s the applied cant is allowed to move, so it eases in and out of the gates.
+            public static double TackFadeRate = 0.3;
+
+            Vector3D _tackU, _tackW;
+            bool _haveTackFrame;
+            double _tackPhase;
+            double _tackCur;      // cant actually applied this tick, after the terminal fade
+
+            public static double TackCos { get { return Math.Cos(TackAngleRad); } }
+
             // ---- HOT-START schedule seed ----------------------------------------------
             public static double HotStartPosEps = 5.0;
 
@@ -231,7 +259,7 @@ namespace IngameScript
 
                 // Engage snapshot. wAtt is reused rather than re-read: MaxTorque is re-measured every
                 // run, so a live re-read partway through a chunked bake would shift the schedule.
-                double aMax = _ship.MaxForwardThrust * _ship.Body.InvMass;
+                double aMax = _ship.MaxForwardThrust * _ship.Body.InvMass * TackCos;
                 if (aMax < 1e-6) aMax = 1e-6;
                 _bkAMax = aMax;
                 _bkAtt = wAtt;
@@ -841,7 +869,10 @@ namespace IngameScript
                 Vector3D pos = rb.Position;
                 Vector3D v = rb.LinearVelocity;
                 double speed = v.Length();
-                double aMax = _ship.MaxForwardThrust * rb.InvMass;
+                // Tack costs cos(angle) off the tangent. Derate at the SOURCE so the schedule, brake
+                // ceiling and every cap plan against the authority the ship will actually have --
+                // otherwise the terminal brake is planned optimistically and overshoots.
+                double aMax = _ship.MaxForwardThrust * rb.InvMass * TackCos;
                 if (aMax < 1e-6) aMax = 1e-6;
                 // SPORT MODE drag-aware braking.
                 double aBrake = aMax + (_ship.SportMode ? Math.Max(0.0, _ship.BrakeDragDecel) : 0.0);
@@ -1131,6 +1162,57 @@ namespace IngameScript
                 bool hardBrake = _terminal == TerminalKind.Stop && aTan < -0.5 * aMax && remaining < speed * 3.0;
 
                 Vector3D aDesired = aTan * tangent + aPerp;
+
+                // ---- TACK: hold the drive off the track ------------------------------
+                // Applied LAST and as a pure rotation, so the magnitude the caps above negotiated is
+                // untouched and every downstream interlock still measures err against the nose it
+                // actually gets. The trajectory excursion is a side effect to be bounded, not the
+                // point -- the emission lobe rides the hull, so canting the nose is the whole trick.
+                // FAIL-SAFE: no cant through the terminal. The brake gate zeroes the drive at 15 deg of
+                // nose error, the cone's precession spends part of that budget on tracking lag, and a
+                // brake that gates its own throttle off does not recover. Ramped, because a step back
+                // to zero is itself a 30 deg jump that would trip the same gate.
+                double tackWant = (hardBrake || _termArrest) ? 0.0 : TackAngleRad;
+                double tackStep = TackFadeRate * dt;
+                if (_tackCur < tackWant) _tackCur = Math.Min(tackWant, _tackCur + tackStep);
+                else if (_tackCur > tackWant) _tackCur = Math.Max(tackWant, _tackCur - tackStep);
+
+                if (_tackCur > 1e-6 && aDesired.LengthSquared() > 1e-12)
+                {
+                    if (!_haveTackFrame)
+                    {
+                        // Frame fixed at engage. A track-relative one would precess with the tangent
+                        // and the cone would wander.
+                        Vector3D seed = Math.Abs(tangent.X) < 0.9 ? Vector3D.UnitX : Vector3D.UnitY;
+                        Vector3D u = Vector3D.Cross(tangent, seed);
+                        if (u.LengthSquared() > 1e-9)
+                        {
+                            _tackU = Vector3D.Normalize(u);
+                            _tackW = Vector3D.Normalize(Vector3D.Cross(tangent, _tackU));
+                            _haveTackFrame = true;
+                        }
+                    }
+                    if (_haveTackFrame)
+                    {
+                        double bias = MathHelper.Clamp(TackBias, 0.0, 1.0);
+                        // The (1-bias) rate scaling is not cosmetic: offsetting the circle by `bias`
+                        // speeds the azimuth up by 1/(1-bias) at its far side, and this cancels it
+                        // exactly, so PEAK nose rate is constant across the whole bias range. Without
+                        // it, a high bias slews the nose fast enough to trip the brake gate.
+                        _tackPhase += 2.0 * Math.PI * dt * (1.0 - bias) / Math.Max(1.0, TackConeSeconds);
+                        if (_tackPhase > 2.0 * Math.PI) _tackPhase -= 2.0 * Math.PI;
+                        Vector3D dir = Vector3D.Normalize(aDesired);
+                        // bias=0 -> unit circle, mean lateral zero. bias=1 -> phase frozen, lat = 2*U,
+                        // a fixed pencil. In between the azimuth dwells on the +U side.
+                        Vector3D lat = (Math.Cos(_tackPhase) + bias) * _tackU
+                                     + Math.Sin(_tackPhase) * _tackW;
+                        lat -= Vector3D.Dot(lat, dir) * dir;
+                        if (lat.LengthSquared() > 1e-9)
+                            aDesired = aDesired.Length()
+                                     * (Math.Cos(_tackCur) * dir
+                                        + Math.Sin(_tackCur) * Vector3D.Normalize(lat));
+                    }
+                }
 
                 // gravity comp + nose direction + throttle.
                 Vector3D fallback;

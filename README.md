@@ -29,6 +29,9 @@ A PB cannot create terminal controls, so CustomData is the analogue of the mod's
 | `goto GPS:Dest:12345.6:-789:4321:` | Set target and fly to it, arriving stopped |
 | `goto 12345.6,-789,4321` | Same, plain coordinates |
 | `goto` | Fly to the target already in `FB_TargetCoord` |
+| `goto 400km` | Fly 400 km along the **cockpit's** forward — point and go |
+| `tack 400km` | Same flight, drive held off the track to dim the Spectrum signature (see below) |
+| `tack 400km 0.6` | Tack with an explicit asymmetry bias, `0`–`1` |
 | `route <wp>;<wp>;...` | Fly a multi-waypoint route (see below) |
 | `target GPS:...` | Set the target without engaging |
 | `align prograde` | Nose along velocity |
@@ -68,6 +71,70 @@ to 25–75 m) instead.
 Each `stop` starts a fresh sub-mission with its own spline and speed schedule, so
 `route ... ; stop GPS:Mid:... ; ...` is how you force a full halt part-way.
 
+### Tack — flying without a searchlight on
+
+`tack` flies **exactly the route `goto` would**. The only difference is that the drive is held at
+an angle to the track, so the engine's emission lobe stops pointing down it.
+
+**Why this matters.** Spectrum models a drive as a *directional* emitter: all fifteen SDX drive
+variants are `AngleDegrees 3`, `Gain 4`, `ScaleWithThrust`, on the Optical band. Inside that 3°
+cone the detection range is **4× the spherical value**; it decays as `sec²` and reaches unity at
+`acos(1/4) + 3° = 78.5°`. The lobe is keyed on the block's cardinal hull face, so **it rides your
+attitude, not your velocity**.
+
+That makes a plain flip-and-burn the worst possible profile. It aims a 4× searchlight at your
+**origin** for the whole acceleration, then flips and aims it at your **destination** for the
+whole brake — and you are closer to the destination when it does. `tack` exists to fix that.
+
+Range retained, for a 5×5 civilian drive at full throttle (69 km spherical / 276 km in-lobe):
+
+| Cant | Range mult | Propellant | Retained |
+|---:|---:|---:|---:|
+| 0° (`goto`) | 4.00 | — | 100% |
+| 10° | 2.73 | +2% | 68% |
+| 20° | 1.92 | +6% | 48% |
+| **30°** (default) | **1.51** | **+15%** | **38%** |
+| 45° | 1.20 | +41% | 30% |
+| ≥78.5° | 1.00 | +∞ | 25% |
+
+30° is the knee — past ~45° the lobe is already flat and the propellant curve is not. Throttling
+down only buys `sqrt`, so **pointing beats throttling**.
+
+#### The bias argument — an exposure trade, not just efficiency
+
+The optional `0`–`1` float controls what the cant azimuth does over time.
+
+- **`0` (default, symmetric).** The azimuth cones round at a constant rate. Lateral velocity is
+  mean-zero by construction, so it costs almost nothing in trajectory — but the sweeping lobe
+  lights roughly **6× the solid angle** a fixed pencil does. It protects whoever is on your track
+  by broadcasting to an annulus a straight burn would never have touched. Each bearing in that
+  band is lit ~21% of the period, so integrated exposure is only ~1.3× worse — but the number of
+  *distinct* bearings that learn you exist is 6× higher, and one logged sample is enough.
+- **`1` (fixed azimuth).** The lobe stays a pencil, so total exposure is the same as a straight
+  burn while the on-track observer is still protected. You pay for it in continuous lateral thrust
+  that the cross-track loop fights, which bows the flown path.
+
+That bow is the point: a symmetric tack is transparent to anyone who **integrates** your track
+rather than sampling it — the mean bearing is still true. Bias is the only knob that produces a
+genuinely deceptive path.
+
+Echo reports all of it: `TACK 30 deg bias 0.60 (-62% lit range, +15% burn, 3.1x sky)`.
+
+#### Caveats
+
+- **The cant fades out at the terminal.** The brake gate zeroes the drive at 15° of nose error,
+  and the cone's precession spends part of that budget on tracking lag; a brake that gates its own
+  throttle off does not recover. So the cant ramps to zero once the hard brake or terminal arrest
+  latches. **Your final approach is un-tacked** — the lobe does point at the destination when you
+  are closest to it. Partial protection, deliberately.
+- **Untested in flight.** Watch `AlignErr` during the brake on a sluggish hull; raise `TackCone`
+  if it climbs toward 15°. `TackAngle = 0` disables the feature entirely.
+- What the cross-track loop settles to when fighting a biased tack is gain-dependent and has not
+  been measured. That is where the "efficiency lost" actually lands.
+- A PB cannot read Spectrum (`RegisterMessageHandler` is not whitelisted), so the script has no
+  idea where anyone is. `tack` protects the two bearings it can infer — origin and destination —
+  and nothing else.
+
 ### CustomData
 
 Everything above the status marker is input; everything below it is written by the script.
@@ -95,6 +162,9 @@ Autopilot_State = Idle
 | `ArrivalDist` | Optional arrival tolerance override, metres (default 40) |
 | `FB_Route` | A route string, same syntax as the `route` argument. Edge-triggered |
 | `SplineSamples` | Schedule samples per spline segment. **48 = mod-identical**; lowering it changes the flown path (see Performance) |
+| `TackAngle` | Cant used by `tack`, degrees. Default 30, capped 60. `0` disables |
+| `TackCone` | Azimuth period, seconds. Default 60. Raise it if `AlignErr` climbs during the brake |
+| `TackBias` | Default bias when `tack` is issued without one. `0`–`1`, default 0 |
 
 Status fields written back: `Autopilot_State`, `Fault`, `AutoRotate_Aligned`, `AutoRotate_Angle`,
 `Speed`, `PhysicalSpeed`, `Autopilot_RemainingDistance`, `Autopilot_TargetName`, `Leg`, `Phase`,
