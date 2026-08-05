@@ -48,6 +48,9 @@ namespace IngameScript
             public int ForceWriteCycle = 60;
             int _writePhase;
             readonly List<IMyShipController> _controllers = new List<IMyShipController>();
+            // Previous scan's actuators, kept only long enough to release any that left the construct.
+            readonly List<IMyThrust> _prevThrusters = new List<IMyThrust>();
+            readonly List<IMyGyro> _prevGyros = new List<IMyGyro>();
             readonly List<IMyUpgradeModule> _upgrades = new List<IMyUpgradeModule>();
 
             MatrixD _refMatrix;
@@ -357,10 +360,21 @@ namespace IngameScript
 
                 FindFlightComputer();
 
+                // A block that leaves the construct -- a shot-off pod, a detached rotor head -- drops
+                // out of the query but keeps whatever override it was last written. The interface
+                // reference stays valid after it departs, so hold the old lists and release anything
+                // that is no longer ours; otherwise the detached piece burns at full thrust forever.
+                _prevThrusters.Clear();
+                for (int i = 0; i < _thrusters.Count; i++) _prevThrusters.Add(_thrusters[i]);
+                _prevGyros.Clear();
+                for (int i = 0; i < _gyros.Count; i++) _prevGyros.Add(_gyros[i]);
+
                 _thrusters.Clear();
                 _gts.GetBlocksOfType<IMyThrust>(_thrusters, b => b.IsSameConstructAs(_me));
                 _gyros.Clear();
                 _gts.GetBlocksOfType<IMyGyro>(_gyros, b => b.IsSameConstructAs(_me));
+
+                ReleaseDeparted();
 
                 // Write caches are indexed by list position, so they are rebuilt with the lists.
                 _lastGx.Clear(); _lastGy.Clear(); _lastGz.Clear(); _lastGOn.Clear(); _gyroOk.Clear();
@@ -375,10 +389,32 @@ namespace IngameScript
                 // Resolve the drive axis before bucketing: the axis with the most thrust becomes
                 // "forward". Every hull whose main drive is not along grid -Z needs this, and getting
                 // it wrong reads MaxForwardThrust as 0 and rejects the mission outright.
-                ResolveDriveAxis();
+                // ONCE, as SEShip does. This used to run on every rescan, so a main drive that merely
+                // browned out -- H2 running thin, combat damage -- could hand "forward" to a lift bank
+                // at the next scan, inverting the reference frame mid-brake.
+                if (!_driveAxisResolved) ResolveDriveAxis();
                 RebuildBuckets();
                 // Buckets changed, so the cached budgets are stale regardless of their own cadence.
                 _runsSinceBudget = int.MaxValue;
+            }
+
+            // Releases overrides on blocks that were ours last scan and are not ours now.
+            void ReleaseDeparted()
+            {
+                for (int i = 0; i < _prevThrusters.Count; i++)
+                {
+                    IMyThrust t = _prevThrusters[i];
+                    if (t == null || t.Closed || _thrusters.Contains(t)) continue;
+                    t.ThrustOverride = 0f;
+                }
+                for (int i = 0; i < _prevGyros.Count; i++)
+                {
+                    IMyGyro g = _prevGyros[i];
+                    if (g == null || g.Closed || _gyros.Contains(g)) continue;
+                    // Zero the rates BEFORE dropping the override, or the setters discard them.
+                    g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f;
+                    g.GyroOverride = false;
+                }
             }
 
             // The mod hangs FB_Velocity off the Flight Computer (an upgrade module). Identify it by
@@ -750,8 +786,12 @@ namespace IngameScript
                 {
                     IMyGyro g = _gyros[i];
                     if (g == null || g.Closed) continue;
-                    g.GyroOverride = false;
+                    // ORDER MATTERS. IMyGyro's Pitch/Yaw/Roll setters are wrapped in `if (GyroOverride)`
+                    // (MyGyro.cs:141-189), so dropping the override first makes the three zeroing writes
+                    // no-ops and the sliders keep the last commanded slew rate -- which is then applied
+                    // in full the moment anything re-ticks Override, including a world reload.
                     g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f;
+                    g.GyroOverride = false;
                 }
                 InvalidateWriteCache();
                 _throttleForward = _strafeRight = _strafeUp = 0.0;
@@ -787,8 +827,12 @@ namespace IngameScript
 
             // Cost-probe entry points. They re-push the SAME values, so the ship is unaffected; the
             // caches are dropped first so what is priced is a real write, not a skipped one.
-            public void ProbeThrust() { InvalidateWriteCache(); ApplyThrust(); }
-            public void ProbeGyros() { InvalidateWriteCache(); ApplyGyros(); }
+            // _hasOverrides is set because these DO claim the blocks: probing from Idle writes
+            // GyroOverride = true at a zero rate, and without the flag ClearOverrides would refuse to
+            // release them, leaving the ship unrotatable with no way back short of ticking every gyro
+            // by hand.
+            public void ProbeThrust() { InvalidateWriteCache(); ApplyThrust(); _hasOverrides = true; }
+            public void ProbeGyros() { InvalidateWriteCache(); ApplyGyros(); _hasOverrides = true; }
 
             // The ModAPI READS a RefreshState does, with nothing stored. RefreshState itself must never
             // be called twice in one run: it would difference position against itself and zero the

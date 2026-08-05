@@ -742,6 +742,10 @@ namespace IngameScript
             _ship.ControllerNameHint = _controllerHint;
             _ship.GyroRateCapOverride = _cfgGyroRateCap;
             _ship.GyroTorqueOverride = _cfgGyroTorque;
+            // Was parsed and echoed back but never reached the closer, so the one documented escape
+            // hatch for the absolute-metre arrival constants did nothing.
+            if (_cfgArrivalDist > 0.0)
+                FineTranslationController.DefaultArrivalDistM = _cfgArrivalDist;
             if (_state == ApState.Goto || _state == ApState.Align)
                 Runtime.UpdateFrequency = ControlFrequency();
         }

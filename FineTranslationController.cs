@@ -61,7 +61,10 @@ namespace IngameScript
             public double AlreadyArrivedSpeed = 2.0;
 
             // Arrival tolerance on TOTAL distance to Target (along + cross).
-            public double ArrivalDistM = 40.0;
+            // Instances are built per sub-mission, so the CustomData knob has to reach them through a
+            // static default rather than being set on one of them.
+            public static double DefaultArrivalDistM = 40.0;
+            public double ArrivalDistM = DefaultArrivalDistM;
             // Let-go radius for the already-arrived fast-path.
             public double FastArriveDistM = 25.0;
 
