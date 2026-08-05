@@ -82,6 +82,7 @@ namespace IngameScript
         double _tackDeg = 30.0;  // cant used by the tack command
         double _tackBias;        // default bias when the tack argument omits one
         bool _pendingGoto;
+        double _pendingAhead;    // >0: a bare-distance goto still waiting for live ship state
 
         string _lastCustomData = "\u0000";   // force a parse on the first run
         int _statusCountdown;
@@ -312,16 +313,27 @@ namespace IngameScript
                         // Spectrum's drive lobe never points down it. See QtrtController.TackAngleRad.
                         QtrtController.TackAngleRad = verb == "tack" ? _tackDeg * Math.PI / 180.0 : 0.0;
                         if (verb == "tack") QtrtController.TackBias = StripTackBias(ref rest);
+                        double ahead = 0.0;
                         if (rest.Length > 0)
                         {
-                            Vector3D c;
-                            if (!TryParseDestination(rest, out c)) { _fault = verb + ": bad coordinate"; return; }
-                            _targetCoord = c;
-                            _targetName = DestinationName(rest);
-                            _hasTarget = true;
+                            if (TryParseAheadDistance(rest, out ahead))
+                            {
+                                // Resolved on the first Tick instead of here -- see TryResolveAhead.
+                                _targetName = DestinationName(rest);
+                                _hasTarget = true;
+                            }
+                            else
+                            {
+                                Vector3D c;
+                                if (!TryParseVector(rest, out c)) { _fault = verb + ": bad coordinate"; return; }
+                                _targetCoord = c;
+                                _targetName = DestinationName(rest);
+                                _hasTarget = true;
+                            }
                         }
                         if (!_hasTarget) { _fault = verb + ": no target set"; return; }
                         EngageGoto();
+                        _pendingAhead = ahead;
                         break;
                     }
                 case "route":
@@ -419,7 +431,12 @@ namespace IngameScript
             _wantMode = RotationMode.None;
             _queue = null;
             _pendingRoute = wps;
+            _pendingAhead = 0.0;
             _fuelGuardStage = 0;
+            // The derived estimator holds the LAST flight's velocity across an idle gap, and its
+            // sample count still reads valid, so without this the plan below is solved from a
+            // phantom speed on any world with no Flight Computer to override it.
+            _ship.ResetVelocityEstimator();
             // The schedule is built from velocity at construction, and the derived velocity needs at
             // least two position samples. Building it from the SE-clamped physical velocity while
             // HighSpeed is engaged would understate the brake distance ~100x, so wait for a real read.
@@ -447,6 +464,7 @@ namespace IngameScript
             _wantMode = m;
             _queue = null; _pendingRoute = null;
             _pendingGoto = false;
+            _pendingAhead = 0.0;
             _state = ApState.Align;
             Runtime.UpdateFrequency = ControlFrequency();
         }
@@ -458,6 +476,7 @@ namespace IngameScript
             _align.Reset();
             _queue = null; _pendingRoute = null;
             _pendingGoto = false;
+            _pendingAhead = 0.0;
             _wantEngage = false;
             _wantMode = RotationMode.None;
             _state = ApState.Idle;
@@ -503,6 +522,23 @@ namespace IngameScript
                         return;
                     }
                     if (!_ship.DerivedVelocityValid) return;   // hold, hands off, until velocity is real
+                    if (_pendingAhead > 0.0)
+                    {
+                        // Position is live only now, so this is where "N km ahead" becomes a point.
+                        Vector3D ac;
+                        if (!TryResolveAhead(_pendingAhead, out ac))
+                        {
+                            _fault = "goto: no heading reference";
+                            _pendingAhead = 0.0;
+                            _ship.ClearOverrides();
+                            _state = ApState.Fault;
+                            Runtime.UpdateFrequency = UpdateFrequency.Update100;
+                            return;
+                        }
+                        _pendingAhead = 0.0;
+                        _targetCoord = ac;
+                        _pendingRoute = new WaypointEntry[] { WaypointEntry.Stop(ac) };
+                    }
                     try
                     {
                         Tag("engage");
@@ -1065,15 +1101,24 @@ namespace IngameScript
             double b;
             if (!TryParseD(rest.Substring(sp + 1).Trim(), out b) || b < 0.0 || b > 1.0) return _tackBias;
             string head = rest.Substring(0, sp).Trim();
-            Vector3D probe;
-            if (head.Length == 0 || !TryParseDestination(head, out probe)) return _tackBias;
+            if (head.Length == 0 || !IsDestination(head)) return _tackBias;
             rest = head;
             return b;
         }
 
-        bool TryParseDestination(string s, out Vector3D v)
+        // Form check only -- deliberately does not resolve, because resolving a bare distance needs
+        // live ship state that a command-time call does not have.
+        bool IsDestination(string s)
         {
-            v = Vector3D.Zero;
+            double d;
+            Vector3D v;
+            return TryParseAheadDistance(s, out d) || TryParseVector(s, out v);
+        }
+
+        // "50km" / "2000m" / "2000" -> metres straight ahead. Suffixes: m (default) and km.
+        static bool TryParseAheadDistance(string s, out double dist)
+        {
+            dist = 0.0;
             if (string.IsNullOrEmpty(s)) return false;
             string t = s.Trim();
 
@@ -1082,19 +1127,35 @@ namespace IngameScript
             if (t.EndsWith("km", StringComparison.OrdinalIgnoreCase)) { scale = 1e3; num = t.Substring(0, t.Length - 2); }
             else if (t.EndsWith("m", StringComparison.OrdinalIgnoreCase)) { num = t.Substring(0, t.Length - 1); }
 
-            double dist;
-            if (TryParseD(num.Trim(), out dist))
-            {
-                dist *= scale;
-                if (dist <= 0.0 || _ship == null) return false;
-                IMyShipController ctrl = _ship.Controller;
-                Vector3D fwd = ctrl != null ? ctrl.WorldMatrix.Forward : _ship.Forward;
-                if (fwd.LengthSquared() < 1e-12) return false;
-                v = _ship.Body.Position + Vector3D.Normalize(fwd) * dist;
-                return true;
-            }
+            if (!TryParseD(num.Trim(), out dist)) return false;
+            dist *= scale;
+            return dist > 0.0;
+        }
 
-            return TryParseVector(t, out v);
+        // Turns a pending "that far ahead" into a world point. Ahead is the CONTROLLER's forward --
+        // where the pilot is looking -- not IShip.Forward, which is the max-thrust axis and can be
+        // up/down on a lander. Falls back to the drive axis only when no controller is live.
+        // MUST run from Tick, after RefreshState: ship state is refreshed nowhere else, so calling
+        // this from the command path measures from a frozen position -- the world origin on a fresh
+        // compile, which silently sent the ship hundreds of km off.
+        bool TryResolveAhead(double dist, out Vector3D v)
+        {
+            v = Vector3D.Zero;
+            if (_ship == null || !_ship.StateValid) return false;
+            IMyShipController ctrl = _ship.Controller;
+            Vector3D fwd = ctrl != null ? ctrl.WorldMatrix.Forward : _ship.Forward;
+            if (fwd.LengthSquared() < 1e-12) return false;
+            v = _ship.Body.Position + Vector3D.Normalize(fwd) * dist;
+            return true;
+        }
+
+        bool TryParseDestination(string s, out Vector3D v)
+        {
+            v = Vector3D.Zero;
+            double dist;
+            if (TryParseAheadDistance(s, out dist)) return TryResolveAhead(dist, out v);
+            if (string.IsNullOrEmpty(s)) return false;
+            return TryParseVector(s.Trim(), out v);
         }
 
         // Accepts "GPS:name:x:y:z:", "x,y,z", "x:y:z" and "x y z".

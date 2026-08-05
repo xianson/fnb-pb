@@ -137,6 +137,24 @@ namespace IngameScript
             }
 
             public IMyShipController Controller { get { return _ctrl; } }
+
+            // False until RefreshState has succeeded once. Position and orientation are meaningless
+            // before that -- Position reads Vector3D.Zero -- so anything measured relative to the
+            // ship has to check this first.
+            public bool StateValid { get { return _stateValid; } }
+            bool _stateValid;
+
+            // Drops the position history and the sample count so DerivedVelocityValid genuinely
+            // waits for fresh readings. RefreshState only runs while a mission is live, so without
+            // this the estimator carries the previous flight's velocity across the idle gap and
+            // still reports itself valid.
+            public void ResetVelocityEstimator()
+            {
+                _havePrevPos = false;
+                _haveVel = false;
+                _velSamples = 0;
+                _rejectRun = 0;
+            }
             // The mod's reading is good immediately. The fallback needs two accepted samples: the
             // first is a bare difference, the second has been through the EMA, and the flip/brake
             // plan is solved once from this number.
@@ -258,6 +276,7 @@ namespace IngameScript
 
                 // Needs _orientation and _inertiaBody, so it runs last.
                 UpdateTorqueEstimate(dt);
+                _stateValid = true;
                 return true;
             }
 
