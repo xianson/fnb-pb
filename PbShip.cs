@@ -759,7 +759,7 @@ namespace IngameScript
             // Bucket every thruster by grid-local push axis; the largest total is the drive axis.
             void ResolveDriveAxis()
             {
-                double fwd = 0, back = 0, left = 0, right = 0, up = 0, down = 0;
+                double[] total = new double[6], biggest = new double[6];
                 MatrixD worldToGrid = MatrixD.Transpose(_me.CubeGrid.WorldMatrix);
                 for (int i = 0; i < _thrusters.Count; i++)
                 {
@@ -775,30 +775,67 @@ namespace IngameScript
                     Vector3D pushGrid = Vector3D.TransformNormal(t.WorldMatrix.Backward, worldToGrid);
                     double maxT = t.MaxThrust;
                     double ax = Math.Abs(pushGrid.X), ay = Math.Abs(pushGrid.Y), az = Math.Abs(pushGrid.Z);
-                    if (ax >= ay && ax >= az) { if (pushGrid.X > 0) right += maxT; else left += maxT; }
-                    else if (ay >= az) { if (pushGrid.Y > 0) up += maxT; else down += maxT; }
-                    else { if (pushGrid.Z < 0) fwd += maxT; else back += maxT; }
+                    int b;
+                    if (ax >= ay && ax >= az) b = pushGrid.X > 0 ? BRight : BLeft;
+                    else if (ay >= az) b = pushGrid.Y > 0 ? BUp : BDown;
+                    else b = pushGrid.Z < 0 ? BFwd : BBack;
+                    total[b] += maxT;
+                    if (maxT > biggest[b]) biggest[b] = maxT;
                 }
 
-                double bestThrust = -1.0;
-                Vector3D driveDir = -Vector3D.UnitZ;
-                if (fwd > bestThrust) { bestThrust = fwd; driveDir = -Vector3D.UnitZ; }
-                if (back > bestThrust) { bestThrust = back; driveDir = Vector3D.UnitZ; }
-                if (left > bestThrust) { bestThrust = left; driveDir = -Vector3D.UnitX; }
-                if (right > bestThrust) { bestThrust = right; driveDir = Vector3D.UnitX; }
-                if (up > bestThrust) { bestThrust = up; driveDir = Vector3D.UnitY; }
-                if (down > bestThrust) { bestThrust = down; driveDir = -Vector3D.UnitY; }
+                // MAIN DRIVE = THE BIGGEST ENGINE, NOT THE MOST ENGINES.
+                // Ranking faces by SUMMED thrust looks obviously right and is wrong on exactly the
+                // hulls this script exists for. Manoeuvring thrusters come in armour-shaped blocks
+                // that get tiled over the hull skin, so a face's total measures how much surface the
+                // builder covered, not whether the main drive is on it. A real case: a 5.4 MN Epstein
+                // on +Y (face total 11.4 MN) lost to nine 1.5 MN RCS on -Z (face total 13.5 MN), and
+                // the ship flew sideways with 0 N of usable thrust on its chosen axis.
+                // The largest single thruster is the discriminator that survives this: a main drive is
+                // one big engine, a manoeuvring bank is many small ones. Face total only breaks ties
+                // between banks of IDENTICAL engines, where it is exactly the right question.
+                int best = -1;
+                for (int b = 0; b < 6; b++)
+                {
+                    if (!(biggest[b] > 0.0)) continue;
+                    if (best < 0
+                        || biggest[b] > biggest[best]
+                        || (biggest[b] == biggest[best] && total[b] > total[best])) best = b;
+                }
 
                 // Latch only on a real answer: a grid asked before it has power finds nothing and would
                 // otherwise keep a default that is 90 deg wrong forever.
-                if (!(bestThrust > 0.0) && _driveAxisResolved) return;
+                if (best < 0)
+                {
+                    if (!_driveAxisResolved) SetDriveFrame(-Vector3D.UnitZ);
+                    return;
+                }
 
-                _driveDirLocal = driveDir;
+                SetDriveFrame(AxisVector(best));
+                _driveAxisResolved = true;
+            }
+
+            static Vector3D AxisVector(int bucket)
+            {
+                switch (bucket)
+                {
+                    case BFwd: return -Vector3D.UnitZ;
+                    case BBack: return Vector3D.UnitZ;
+                    case BRight: return Vector3D.UnitX;
+                    case BLeft: return -Vector3D.UnitX;
+                    case BUp: return Vector3D.UnitY;
+                    default: return -Vector3D.UnitY;
+                }
+            }
+
+            // Drive direction plus an arbitrary but stable perpendicular for the frame's "up". Roll
+            // about the drive axis is not controlled, so any consistent choice works.
+            void SetDriveFrame(Vector3D driveDirLocal)
+            {
+                _driveDirLocal = driveDirLocal;
                 Vector3D candidate = Vector3D.UnitY;
                 if (Math.Abs(Vector3D.Dot(candidate, _driveDirLocal)) > 0.99)
                     candidate = Vector3D.UnitZ;
                 _driveUpLocal = Vector3D.Normalize(candidate - Vector3D.Dot(candidate, _driveDirLocal) * _driveDirLocal);
-                _driveAxisResolved = bestThrust > 0.0;
             }
 
             // Thruster orientation relative to the grid is fixed, so the axis assignment is cached and
