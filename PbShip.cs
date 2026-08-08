@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using Sandbox.ModAPI.Ingame;
 using Sandbox.ModAPI.Interfaces;
 using VRage.Game.ModAPI.Ingame;
@@ -476,31 +477,283 @@ namespace IngameScript
                 }
             }
 
+            // Every ship-level read -- CenterOfMass, GetShipVelocities, gravity, mass -- comes out of
+            // this one block, so picking it wrong is not a small error. Two things make the old
+            // "first functional block wins" rule unsafe:
+            //   - IMyShipController is wider than "cockpit": passenger seats and cryo chambers are
+            //     controllers too. On a hull with no Main Cockpit flagged, the ship was handed to
+            //     whichever of them GetBlocksOfType listed first.
+            //   - IsSameConstructAs pulls in subgrids, so that block can sit on a rotor pod and report
+            //     the POD's centre of mass, velocity and mass -- numbers that look perfectly sane.
+            // Score instead, and tie-break on EntityId so the pick is the same block every rescan
+            // rather than drifting with query order.
             IMyShipController PickController()
             {
+                IMyShipController hinted = ControllerNameHint.Length > 0 ? PickBest(true) : null;
+                // Named hint missed: fall back rather than refusing to fly.
+                return hinted ?? PickBest(false);
+            }
+
+            IMyShipController PickBest(bool useHint)
+            {
                 IMyShipController best = null;
+                int bestScore = int.MinValue;
+                long bestId = 0;
+                long myGrid = _me.CubeGrid != null ? _me.CubeGrid.EntityId : 0;
+
                 for (int i = 0; i < _controllers.Count; i++)
                 {
                     IMyShipController c = _controllers[i];
-                    if (c == null || c.Closed) continue;
-                    if (ControllerNameHint.Length > 0)
-                    {
-                        if (c.CustomName.IndexOf(ControllerNameHint, StringComparison.OrdinalIgnoreCase) >= 0)
-                            return c;
+                    if (c == null || c.Closed || !c.IsFunctional) continue;
+                    if (useHint && c.CustomName.IndexOf(ControllerNameHint, StringComparison.OrdinalIgnoreCase) < 0)
                         continue;
+
+                    // Weighted rather than filtered: a hull with nothing but passenger seats still has
+                    // to get an answer, it just gets the least-bad one.
+                    int score = 0;
+                    if (c.CanControlShip) score += 16;
+                    if (c.CubeGrid != null && c.CubeGrid.EntityId == myGrid) score += 8;
+                    if (c.IsMainCockpit) score += 4;
+
+                    if (score > bestScore || (score == bestScore && c.EntityId < bestId))
+                    {
+                        best = c; bestScore = score; bestId = c.EntityId;
                     }
-                    // No hint: prefer a working main cockpit / remote, else any working controller.
-                    if (!c.IsFunctional) continue;
-                    if (best == null) best = c;
-                    if (c.IsMainCockpit) return c;
-                }
-                if (best == null && ControllerNameHint.Length > 0)
-                {
-                    // Named hint missed: fall back rather than refusing to fly.
-                    for (int i = 0; i < _controllers.Count; i++)
-                        if (_controllers[i] != null && _controllers[i].IsFunctional) return _controllers[i];
                 }
                 return best;
+            }
+
+            // Diagnostics for the status panel: the two ways the pick above can still be the wrong
+            // block, surfaced rather than left to be inferred from bad flight.
+            public bool ControllerCanControl { get { return _ctrl != null && _ctrl.CanControlShip; } }
+            public bool ControllerOnPbGrid
+            {
+                get
+                {
+                    return _ctrl != null && _ctrl.CubeGrid != null && _me.CubeGrid != null
+                        && _ctrl.CubeGrid.EntityId == _me.CubeGrid.EntityId;
+                }
+            }
+
+            // Grid-local drive axis as text, e.g. "-Z (grid forward)". The frame everything here flies
+            // in, and invisible from the terminal until now.
+            public string DriveAxisName
+            {
+                get
+                {
+                    Vector3D d = _driveDirLocal;
+                    string s = d.Z < -0.5 ? "-Z (grid forward)"
+                             : d.Z > 0.5 ? "+Z (grid back)"
+                             : d.X > 0.5 ? "+X (grid right)"
+                             : d.X < -0.5 ? "-X (grid left)"
+                             : d.Y > 0.5 ? "+Y (grid up)"
+                             : "-Y (grid down)";
+                    return _driveAxisResolved ? s : s + " [unresolved, default]";
+                }
+            }
+
+            static string FaceName(int bucket)
+            {
+                switch (bucket)
+                {
+                    case BFwd: return "fwd(-Z)";
+                    case BBack: return "back(+Z)";
+                    case BRight: return "right(+X)";
+                    case BLeft: return "left(-X)";
+                    case BUp: return "up(+Y)";
+                    default: return "down(-Y)";
+                }
+            }
+
+            static string Fmt3(Vector3D v)
+            {
+                return v.X.ToString("0.##", Inv) + "," + v.Y.ToString("0.##", Inv) + "," + v.Z.ToString("0.##", Inv);
+            }
+
+            static string MN(double newtons) { return (newtons / 1e6).ToString("0.0", Inv) + " MN"; }
+
+            // Everything the adapter knows about the construct, for the `debug` argument. Deliberately
+            // reports the RAW inputs (per block, per face) rather than the conclusions, because every
+            // bug found here so far has been the script reading a sane number off the wrong block.
+            public void DescribeShip(StringBuilder sb)
+            {
+                RescanBlocks();
+                _runsSinceScan = 0;
+                RefreshBudgets();
+                _runsSinceBudget = 0;
+
+                IMyCubeGrid g = _me.CubeGrid;
+                Vector3I cells = g.Max - g.Min + Vector3I.One;
+                // Read live rather than reporting the cached value: RefreshState does not run while
+                // Idle, which is exactly when this gets asked, and a cold cache would print 0 t.
+                double massNow = _ctrl != null ? _ctrl.CalculateShipMass().PhysicalMass : _mass;
+                sb.Append("; [grid] ").Append(g.CustomName)
+                  .Append("  size=").Append(g.GridSizeEnum.ToString())
+                  .Append("  cells=").Append(cells.X.ToString(Inv)).Append('x')
+                  .Append(cells.Y.ToString(Inv)).Append('x').Append(cells.Z.ToString(Inv))
+                  .Append("  mass=").Append((massNow / 1000.0).ToString("0", Inv)).Append(" t\n");
+                if (!_stateValid)
+                    sb.Append("; [note] autopilot idle -- [state] below is cold; [frame] is computed live\n");
+
+                // CONTROLLERS. The picked one is the source of CoM, velocity, gravity and mass, so the
+                // rejects are printed too -- a wrong pick is only visible next to what it beat.
+                sb.Append("; [controllers] ").Append(_controllers.Count.ToString(Inv)).Append(" found\n");
+                for (int i = 0; i < _controllers.Count && i < 12; i++)
+                {
+                    IMyShipController c = _controllers[i];
+                    if (c == null || c.Closed) continue;
+                    sb.Append(";   ").Append(c.CustomName)
+                      .Append(c.CanControlShip ? "  canControl" : "  CANNOT-CONTROL")
+                      .Append(c.IsMainCockpit ? "  main" : "")
+                      .Append(c.IsFunctional ? "" : "  BROKEN")
+                      .Append(c.CubeGrid != null && c.CubeGrid.EntityId == g.EntityId ? "" : "  SUBGRID")
+                      .Append(ReferenceEquals(c, _ctrl) ? "   <== PICKED" : "")
+                      .Append('\n');
+                }
+
+                // Built from the grid matrix here rather than read off _refMatrix, so the answer to
+                // "which way does the script think forward is" is correct even from a cold Idle.
+                MatrixD gm = g.WorldMatrix;
+                sb.Append("; [frame] driveAxis=").Append(DriveAxisName)
+                  .Append("  driveUpLocal=").Append(Fmt3(_driveUpLocal))
+                  .Append("\n;         forwardWorld=").Append(Fmt3(Vector3D.TransformNormal(_driveDirLocal, gm)))
+                  .Append("  upWorld=").Append(Fmt3(Vector3D.TransformNormal(_driveUpLocal, gm)))
+                  .Append("\n;         cockpitFwdWorld=")
+                  .Append(_ctrl == null ? "(no controller)" : Fmt3(_ctrl.WorldMatrix.Forward));
+                if (_ctrl != null)
+                {
+                    // The one number that says "the drive and the seat disagree", which is what a
+                    // 90-deg-off complaint actually looks like from the pilot's chair.
+                    double d = Vector3D.Dot(Vector3D.Normalize(Vector3D.TransformNormal(_driveDirLocal, gm)),
+                                            Vector3D.Normalize(_ctrl.WorldMatrix.Forward));
+                    if (d > 1.0) d = 1.0; else if (d < -1.0) d = -1.0;
+                    sb.Append("  driveVsCockpit=").Append((Math.Acos(d) * 180.0 / Math.PI).ToString("0.0", Inv))
+                      .Append(" deg");
+                }
+                sb.Append('\n');
+
+                AppendDriveTable(sb);
+
+                sb.Append("; [budgets] fwd=").Append(MN(_maxForwardThrust))
+                  .Append(" back=").Append(MN(_maxBackwardThrust))
+                  .Append(" right=").Append(MN(_maxRightThrust))
+                  .Append(" left=").Append(MN(_maxLeftThrust))
+                  .Append("\n;           up=").Append(MN(_maxUpThrust))
+                  .Append(" down=").Append(MN(_maxDownThrust))
+                  .Append(" lateral=").Append(MN(_maxLateralThrust)).Append('\n');
+
+                int gyroOk = 0;
+                double gyroPower = 0.0;
+                for (int i = 0; i < _gyros.Count; i++)
+                {
+                    IMyGyro gy = _gyros[i];
+                    if (gy == null || gy.Closed || !gy.IsFunctional || !gy.Enabled) continue;
+                    gyroOk++;
+                    gyroPower += gy.GyroPower;
+                }
+                sb.Append("; [gyros] ").Append(_gyros.Count.ToString(Inv)).Append(" found, ")
+                  .Append(gyroOk.ToString(Inv)).Append(" live, powerSum=")
+                  .Append(gyroPower.ToString("0.##", Inv))
+                  .Append("\n;         torque=").Append(_maxTorque.ToString("0.###e+0", Inv))
+                  .Append(GyroTorqueOverride > 0.0 ? " (pinned)" : (_torqueCalibrated ? " (measured)" : " (SEED, not yet measured)"))
+                  .Append("  seed=").Append(_torqueSeed.ToString("0.###e+0", Inv))
+                  .Append("  rateCap=").Append(GyroRateCap.ToString("0.###", Inv)).Append(" rad/s\n");
+
+                sb.Append("; [state] pos=").Append(Fmt3(_position))
+                  .Append("\n;         vel=").Append(_linearVelocity.Length().ToString("0.0", Inv)).Append(" m/s ")
+                  .Append(_modVelocityOk ? "(FB_Velocity)" : "(derived)")
+                  .Append("  physVel=").Append(_physicalVelocity.Length().ToString("0.0", Inv)).Append(" m/s")
+                  .Append("\n;         omega=").Append(_angularVelocity.Length().ToString("0.###", Inv)).Append(" rad/s")
+                  .Append("  gravity=").Append(_gravity.Length().ToString("0.##", Inv)).Append(" m/s2")
+                  .Append("\n;         inertia=").Append(Fmt3(_inertiaBody))
+                  .Append("  stateValid=").Append(_stateValid ? "yes" : "NO").Append('\n');
+
+                sb.Append("; [modlink] flightComputer=")
+                  .Append(_fcBlock == null ? "absent" : _fcBlock.CustomName).Append('\n');
+            }
+
+            // What ResolveDriveAxis actually sees, per grid face. Emitted by the `drive` argument.
+            // The axis it picks is otherwise invisible, and the cases worth diagnosing are the ones
+            // where a thruster is SKIPPED or lands on a face nobody expected -- neither of which can
+            // be inferred from the chosen axis alone. Reports nominal AND effective thrust, because
+            // ResolveDriveAxis ranks on nominal while the flight budgets use effective.
+            public string DescribeDrive()
+            {
+                // The block lists only refresh from RefreshState, which does not run while Idle --
+                // and Idle is exactly when this gets asked. Rescan so the report is of the real ship.
+                RescanBlocks();
+                _runsSinceScan = 0;
+                StringBuilder sb = new StringBuilder();
+                AppendDriveTable(sb);
+                return sb.ToString();
+            }
+
+            void AppendDriveTable(StringBuilder sb)
+            {
+                double[] total = new double[6], eff = new double[6], biggest = new double[6];
+                int[] count = new int[6];
+                string[] bigName = new string[6];
+                StringBuilder skips = new StringBuilder(), darkList = new StringBuilder();
+                int skipped = 0, dark = 0;
+
+                MatrixD worldToGrid = MatrixD.Transpose(_me.CubeGrid.WorldMatrix);
+                for (int i = 0; i < _thrusters.Count; i++)
+                {
+                    IMyThrust t = _thrusters[i];
+                    if (t == null || t.Closed) continue;
+                    Vector3D pushGrid = Vector3D.TransformNormal(t.WorldMatrix.Backward, worldToGrid);
+                    double ax = Math.Abs(pushGrid.X), ay = Math.Abs(pushGrid.Y), az = Math.Abs(pushGrid.Z);
+                    int b;
+                    if (ax >= ay && ax >= az) b = pushGrid.X > 0 ? BRight : BLeft;
+                    else if (ay >= az) b = pushGrid.Y > 0 ? BUp : BDown;
+                    else b = pushGrid.Z < 0 ? BFwd : BBack;
+
+                    // Exactly the test ResolveDriveAxis applies, so a skip here is a skip there.
+                    if (!t.IsFunctional)
+                    {
+                        skipped++;
+                        if (skipped <= 8)
+                            skips.Append(";   SKIPPED ").Append(t.CustomName)
+                                 .Append(" -> ").Append(FaceName(b))
+                                 .Append(' ').Append((t.MaxThrust / 1e6).ToString("0.0", Inv))
+                                 .Append(" MN [damaged/incomplete]\n");
+                        continue;
+                    }
+                    count[b]++;
+                    total[b] += t.MaxThrust;
+                    eff[b] += t.MaxEffectiveThrust;
+                    if (t.MaxThrust > biggest[b]) { biggest[b] = t.MaxThrust; bigName[b] = t.CustomName; }
+                    // Counted for the axis vote but contributing no thrust right now. This is the gap
+                    // between the axis the script picks and the budget it can actually spend.
+                    if (!t.IsWorking)
+                    {
+                        dark++;
+                        if (dark <= 8)
+                            darkList.Append(";   DARK ").Append(t.CustomName)
+                                    .Append(" -> ").Append(FaceName(b))
+                                    .Append(' ').Append((t.MaxThrust / 1e6).ToString("0.0", Inv)).Append(" MN")
+                                    .Append(t.Enabled ? " [no power/fuel]" : " [switched off]")
+                                    .Append('\n');
+                    }
+                }
+
+                sb.Append("; [thrusters] seen = ").Append(_thrusters.Count.ToString(Inv))
+                  .Append(", skipped (not functional) = ").Append(skipped.ToString(Inv))
+                  .Append(", dark (functional, no thrust now) = ").Append(dark.ToString(Inv)).Append('\n');
+                for (int b = 0; b < 6; b++)
+                {
+                    sb.Append(";  ").Append(FaceName(b).PadRight(10))
+                      .Append(" n=").Append(count[b].ToString(Inv).PadLeft(3))
+                      .Append(" nominal=").Append((total[b] / 1e6).ToString("0.0", Inv).PadLeft(8)).Append(" MN")
+                      .Append(" effective=").Append((eff[b] / 1e6).ToString("0.0", Inv).PadLeft(8)).Append(" MN")
+                      .Append(" biggest=").Append((biggest[b] / 1e6).ToString("0.0", Inv).PadLeft(7)).Append(" MN");
+                    if (bigName[b] != null) sb.Append(" (").Append(bigName[b]).Append(')');
+                    sb.Append('\n');
+                }
+                if (skips.Length > 0) sb.Append(skips);
+                if (skipped > 8) sb.Append(";   ... and ").Append((skipped - 8).ToString(Inv)).Append(" more\n");
+                if (darkList.Length > 0) sb.Append(darkList);
+                if (dark > 8) sb.Append(";   ... and ").Append((dark - 8).ToString(Inv)).Append(" more dark\n");
             }
 
             // Bucket every thruster by grid-local push axis; the largest total is the drive axis.
@@ -511,7 +764,14 @@ namespace IngameScript
                 for (int i = 0; i < _thrusters.Count; i++)
                 {
                     IMyThrust t = _thrusters[i];
-                    if (t == null || t.Closed || !t.IsWorking) continue;
+                    // IsFunctional, NOT IsWorking. Which way a thruster is bolted is a property of the
+                    // hull; whether it is lit right now is not. IsWorking is false for a thruster that
+                    // is switched off, out of fuel or short of power, so a main drive that happened to
+                    // be dark at the instant of the first scan was dropped from the vote entirely --
+                    // and since the answer is latched below, a ship whose Epstein was cold for one
+                    // scan flew belly-first for the rest of the session behind a handful of hull RCS.
+                    // The live thrust budget still gates on IsWorking; that is RefreshBudgets' job.
+                    if (t == null || t.Closed || !t.IsFunctional) continue;
                     Vector3D pushGrid = Vector3D.TransformNormal(t.WorldMatrix.Backward, worldToGrid);
                     double maxT = t.MaxThrust;
                     double ax = Math.Abs(pushGrid.X), ay = Math.Abs(pushGrid.Y), az = Math.Abs(pushGrid.Z);

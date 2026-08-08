@@ -61,6 +61,8 @@ namespace IngameScript
         WaypointQueueController _queue;
         WaypointEntry[] _pendingRoute;
         string _routeText = "";
+        // Sticky until the next `drive` run, so it survives the status rewrites and can be read at leisure.
+        string _driveReport = "";
         GyroCalibrator _cal;
         FuelEstimator _fuel;
         int _fuelScanCountdown;
@@ -227,7 +229,9 @@ namespace IngameScript
                 _echoText = BuildEcho();
             }
             else TrackPerf();
-            Echo(_echoText);
+            // The detail panel is the one place a report can be read without opening CustomData and
+            // without racing the config round-trip, so a live debug dump takes it over entirely.
+            Echo(_driveReport.Length > 0 ? _driveReport : _echoText);
         }
 
         // Compares measured endurance against the burn the current plan still needs. Advisory only --
@@ -398,6 +402,26 @@ namespace IngameScript
                         StartProbe(what, n);
                         break;
                     }
+                case "drive":
+                    // One-shot: dump what the drive-axis resolver sees, per grid face, into the
+                    // status section. Rescans first, so it works from Idle.
+                    _driveReport = "; ---- drive report ----\n" + _ship.DescribeDrive();
+                    _statusCountdown = 0;
+                    break;
+                case "debug":
+                    // Full construct dump. `debug off` clears it again; it is sticky otherwise so it
+                    // survives the status rewrites and can be read at leisure.
+                    if (rest.Equals("off", StringComparison.OrdinalIgnoreCase)
+                        || rest.Equals("clear", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _driveReport = "";
+                    }
+                    else
+                    {
+                        _driveReport = BuildDebugReport();
+                    }
+                    _statusCountdown = 0;
+                    break;
                 case "rescan":
                     _ship.ClearOverrides();
                     _ship = new PbShip(GridTerminalSystem, Me, Echo);
@@ -515,7 +539,10 @@ namespace IngameScript
                 {
                     if (!(_ship.MaxForwardThrust > 1e-6))
                     {
-                        _fault = "no main-drive thrust";
+                        // The axis is now resolved from how the hull is BUILT, so this fires when the
+                        // drive is genuinely dark -- off, out of fuel, unpowered. Say so, and say where
+                        // to look, rather than flying off down whatever face still has thrust.
+                        _fault = "no thrust on drive axis " + _ship.DriveAxisName + " -- run `drive`";
                         _ship.ClearOverrides();
                         _state = ApState.Fault;
                         Runtime.UpdateFrequency = UpdateFrequency.Update100;
@@ -737,6 +764,60 @@ namespace IngameScript
             }
         }
 
+        // Everything needed to diagnose "it is pointing the wrong way" without being in the seat.
+        // Ordered outside-in: what the script found, then what it concluded, then what it is doing --
+        // so a wrong conclusion can be traced back to the block it came from.
+        string BuildDebugReport()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("; ======== debug report ========\n");
+            sb.Append("; PB=").Append(Me.CustomName)
+              .Append("  state=").Append(StateName(_state));
+            if (_fault.Length > 0) sb.Append("  fault='").Append(_fault).Append('\'');
+            sb.Append('\n');
+
+            _ship.DescribeShip(sb);
+
+            sb.Append("; [autopilot] hasTarget=").Append(_hasTarget ? "yes" : "no");
+            if (_hasTarget) sb.Append(" target=").Append(Fmt(_targetCoord));
+            if (_targetName.Length > 0) sb.Append(" name=").Append(_targetName);
+            sb.Append("\n;             alignMode=").Append(ModeName(_align.Mode))
+              .Append(" aligned=").Append(_align.IsAligned ? "yes" : "no")
+              .Append(" angle=").Append(_align.AngleDeg.ToString("0.0", Inv)).Append(" deg");
+            if (_hasTarget && _ship.StateValid)
+            {
+                // The number that actually matters when the complaint is "it points the wrong way":
+                // where the drive is aimed versus where the target is.
+                Vector3D toTgt = _targetCoord - _ship.Body.Position;
+                if (toTgt.LengthSquared() > 1.0)
+                    sb.Append("\n;             driveVsTarget=")
+                      .Append((MathHelpers.AngleBetween(_ship.Forward, toTgt) * 180.0 / Math.PI)
+                          .ToString("0.0", Inv)).Append(" deg")
+                      .Append(" range=").Append(toTgt.Length().ToString("0", Inv)).Append(" m");
+            }
+            sb.Append('\n');
+            if (_queue != null)
+            {
+                sb.Append(";             leg=").Append((_queue.CurrentSubMission + 1).ToString(Inv))
+                  .Append('/').Append(_queue.SubMissionCount.ToString(Inv))
+                  .Append(" planning=").Append(_queue.Planning ? "yes" : "no")
+                  .Append(" done=").Append(_queue.IsDone ? "yes" : "no").Append('\n');
+            }
+            sb.Append("; [cmd] throttle=").Append(_ship.ThrottleForward.ToString("0.00", Inv))
+              .Append(" strafeR=").Append(_ship.StrafeRight.ToString("0.00", Inv))
+              .Append(" strafeU=").Append(_ship.StrafeUp.ToString("0.00", Inv))
+              .Append(" pitch=").Append(_ship.Pitch.ToString("0.00", Inv))
+              .Append(" yaw=").Append(_ship.Yaw.ToString("0.00", Inv))
+              .Append(" roll=").Append(_ship.Roll.ToString("0.00", Inv)).Append('\n');
+            sb.Append("; [runtime] instr=").Append(Runtime.CurrentInstructionCount.ToString(Inv))
+              .Append('/').Append(Runtime.MaxInstructionCount.ToString(Inv))
+              .Append(" lastRun=").Append(Runtime.LastRunTimeMs.ToString("0.###", Inv)).Append(" ms")
+              .Append(" writes=").Append(_ship.LastWriteCount.ToString(Inv))
+              .Append(" dt=").Append(Runtime.TimeSinceLastRun.TotalSeconds.ToString("0.####", Inv)).Append(" s\n");
+            sb.Append("; ======== end debug ========\n");
+            return sb.ToString();
+        }
+
         void ApplyConfigToShip()
         {
             _ship.ControllerNameHint = _controllerHint;
@@ -758,6 +839,7 @@ namespace IngameScript
             StringBuilder sb = new StringBuilder();
             sb.Append("; FlipAndBurn autopilot (PB). Edit the fields below, then recompile or run.\n");
             sb.Append("; Arguments: goto <gps|x,y,z> | route <wp>;<wp>;... | align <mode> | stop\n");
+            sb.Append(";            debug (full dump, `debug off` clears) | drive (thrusters only)\n");
             sb.Append("; route waypoint: [stop|spline|fly][@tol] <gps|x,y,z>; last one defaults to stop\n");
             sb.Append("FB_TargetCoord = ").Append(_hasTarget ? Fmt(_targetCoord) : "").Append('\n');
             sb.Append("FB_Route = ").Append(_routeText).Append('\n');
@@ -791,6 +873,15 @@ namespace IngameScript
             if (_queue != null && _queue.Planning)
                 sb.Append("Autopilot_Planning = ").Append(_queue.PlanWorkLeft.ToString(Inv)).Append('\n');
             if (_fault.Length > 0) sb.Append("Fault = ").Append(_fault).Append('\n');
+            // Which block the ship is actually being measured from, and which way "forward" resolved.
+            // Both are picked automatically and both are silent when wrong, so they are printed.
+            IMyShipController rc = _ship.Controller;
+            sb.Append("Controller_Resolved = ").Append(rc == null ? "(none)" : rc.CustomName);
+            if (rc != null && !_ship.ControllerCanControl) sb.Append(" [cannot control ship]");
+            if (rc != null && !_ship.ControllerOnPbGrid) sb.Append(" [SUBGRID]");
+            sb.Append('\n');
+            sb.Append("DriveAxis = ").Append(_ship.DriveAxisName).Append('\n');
+            if (_driveReport.Length > 0) sb.Append(_driveReport);
             sb.Append("AutoRotate_Aligned = ").Append(_align.IsAligned ? "true" : "false").Append('\n');
             sb.Append("AutoRotate_Angle = ").Append(_align.AngleDeg.ToString("0.0", Inv)).Append('\n');
 
@@ -1146,8 +1237,12 @@ namespace IngameScript
         {
             v = Vector3D.Zero;
             if (_ship == null || !_ship.StateValid) return false;
-            IMyShipController ctrl = _ship.Controller;
-            Vector3D fwd = ctrl != null ? ctrl.WorldMatrix.Forward : _ship.Forward;
+            // "N km ahead" is ahead along the DRIVE axis. Reading the controller block's own
+            // WorldMatrix.Forward was the only place in the script that used a block's orientation for
+            // anything, and it disagreed with the frame the ref matrix, the thruster buckets, the
+            // inertia tensor and every controller are built in. On a hull with no Main Cockpit flagged
+            // it aimed the mission down whatever seat the block query happened to list first.
+            Vector3D fwd = _ship.Forward;
             if (fwd.LengthSquared() < 1e-12) return false;
             v = _ship.Body.Position + Vector3D.Normalize(fwd) * dist;
             return true;
