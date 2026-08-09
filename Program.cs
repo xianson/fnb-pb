@@ -78,6 +78,9 @@ namespace IngameScript
         RotationMode _wantMode = RotationMode.None;
         bool _wantEngage;
         string _controllerHint = "";
+        // The coordinate text the roll reference was set from. Kept so the CustomData poll can
+        // edge-trigger on a CHANGE rather than re-resolving the direction every time.
+        string _rollRefText = "";
         double _cfgGyroRateCap = OrientationController.CommandedRateCapBase;
         double _cfgArrivalDist = -1.0;
         double _cfgGyroTorque;   // 0 = measure it
@@ -378,6 +381,31 @@ namespace IngameScript
                         RotationMode m;
                         if (!AlignController.TryParse(rest, out m)) { _fault = "align: bad mode"; return; }
                         EngageAlign(m);
+                        break;
+                    }
+                // ROLL REFERENCE for align. `rollref <coord>` pins the ship's up axis toward a world
+                // direction so repeated aligns onto the same bearing come back to the same attitude;
+                // `rollref none` frees it. Takes the same coordinate forms as `target` -- the vector
+                // used is the direction from the ship to that point, so a GPS a long way off behaves
+                // as a fixed direction rather than something that swings as the ship moves.
+                case "rollref":
+                    {
+                        string r = rest.Trim();
+                        if (r.Length == 0 || r.Equals("none", StringComparison.OrdinalIgnoreCase)
+                                          || r.Equals("off", StringComparison.OrdinalIgnoreCase)
+                                          || r.Equals("free", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _align.HasRollRef = false;
+                            _rollRefText = "";
+                            break;
+                        }
+                        Vector3D rc;
+                        if (!TryParseDestination(r, out rc)) { _fault = "rollref: bad coordinate"; return; }
+                        Vector3D d = rc - _ship.Body.Position;
+                        if (d.LengthSquared() < 1.0) { _fault = "rollref: too close to give a direction"; return; }
+                        _align.RollRef = Vector3D.Normalize(d);
+                        _align.HasRollRef = true;
+                        _rollRefText = r;
                         break;
                     }
                 case "stop":
@@ -746,6 +774,33 @@ namespace IngameScript
                     case "controller":
                         _controllerHint = val;
                         break;
+                    case "rollref":
+                        {
+                            string rr = val.Trim();
+                            if (rr.Length == 0 || rr.Equals("none", StringComparison.OrdinalIgnoreCase))
+                            {
+                                _align.HasRollRef = false;
+                                _rollRefText = "";
+                            }
+                            else if (rr != _rollRefText)
+                            {
+                                // Edge-triggered on the text: the reference is captured as a
+                                // DIRECTION from wherever the ship was when it was set, so
+                                // re-resolving it every poll would let it drift as the ship moves.
+                                Vector3D rc;
+                                if (TryParseDestination(rr, out rc))
+                                {
+                                    Vector3D d = rc - _ship.Body.Position;
+                                    if (d.LengthSquared() >= 1.0)
+                                    {
+                                        _align.RollRef = Vector3D.Normalize(d);
+                                        _align.HasRollRef = true;
+                                        _rollRefText = rr;
+                                    }
+                                }
+                            }
+                        }
+                        break;
                     case "gyroratecap":
                         double g;
                         if (TryParseD(val, out g) && g > 0.0)
@@ -903,6 +958,9 @@ namespace IngameScript
             sb.Append("FB_TargetCoord = ").Append(_hasTarget ? Fmt(_targetCoord) : "").Append('\n');
             sb.Append("FB_Route = ").Append(_routeText).Append('\n');
             sb.Append("AutoRotate_Mode = ").Append(ModeName(_align.Mode)).Append('\n');
+            // Mirror the REQUEST, not derived state -- same rule as FB_Engage below. Echoing what we
+            // resolved it to would make the poll read our own output back as a fresh instruction.
+            sb.Append("RollRef = ").Append(_align.HasRollRef ? _rollRefText : "none").Append('\n');
             // ECHO THE INTENT, NOT THE MOMENTARY STATE.
             //
             // This used to write (_state == Goto). Everything else here is a status field, but
@@ -1025,6 +1083,8 @@ namespace IngameScript
             if (_driveReport.Length > 0) sb.Append(_driveReport);
             sb.Append("AutoRotate_Aligned = ").Append(_align.IsAligned ? "true" : "false").Append('\n');
             sb.Append("AutoRotate_Angle = ").Append(_align.AngleDeg.ToString("0.0", Inv)).Append('\n');
+            if (_align.HasRollRef)
+                sb.Append("RollErr = ").Append(_align.RollDeg.ToString("0.0", Inv)).Append('\n');
 
             IRigidBody rb = _ship.Body;
             double spd = rb.LinearVelocity.Length();

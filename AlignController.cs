@@ -42,6 +42,16 @@ namespace IngameScript
             public Vector3D GpsTarget;
             public bool HasGpsTarget;
 
+            // ROLL REFERENCE. Align aims one axis; the roll about it is free, and the shortest-arc
+            // solve lands on whatever the geometry gives. Set this to a world direction and the
+            // ship's up axis is held as close to it as the aim allows, so repeated aligns onto the
+            // same bearing come back to the SAME attitude rather than a rolled one. Only the
+            // component perpendicular to the aim is used; a reference parallel to it is ignored.
+            public Vector3D RollRef;
+            public bool HasRollRef;
+            // Roll error about the aim axis, degrees. 180 when no reference is set.
+            public double RollDeg { get; private set; }
+
             // Below this speed the retrograde nose FREEZES on the last clean -v/|v| instead of chasing
             // a direction that becomes ill-conditioned as v -> 0.
             const double RetroHoldFreezeSpeed = 10.0;   // m/s
@@ -57,6 +67,23 @@ namespace IngameScript
             // reported flag only -- it is not the attitude law's terminal latch, which is a separate
             // 1 deg command-zeroing band.
             public double AlignedToleranceDeg = 2.0;
+            // Looser than the aim tolerance on purpose: roll authority is the weakest axis on a long
+            // hull (roll inertia is the small one, but the reference is only meaningful to within
+            // how well the aim itself is held), and a tight band here stalls the aligned flag.
+            public double RollToleranceDeg = 5.0;
+
+            // Signed-magnitude roll error about the aim axis: how far the ship's up has rotated away
+            // from the reference, measured in the plane perpendicular to where we are pointing.
+            double MeasureRollDeg(Vector3D dir)
+            {
+                Vector3D want = RollRef - dir * Vector3D.Dot(RollRef, dir);
+                if (want.LengthSquared() < 1e-9) return 0.0;      // no roll information in it
+                // IShip exposes only Forward, so take up from the body orientation directly.
+                Vector3D shipUp = Vector3D.Transform(Vector3D.Up, _ship.Body.Orientation);
+                Vector3D have = shipUp - dir * Vector3D.Dot(shipUp, dir);
+                if (have.LengthSquared() < 1e-9) return 0.0;
+                return MathHelpers.AngleBetween(have, want) * 180.0 / Math.PI;
+            }
 
             public AlignController(IShip ship, OrientationController att)
             {
@@ -151,11 +178,17 @@ namespace IngameScript
                 }
 
                 HasDirection = true;
-                _att.Target = MathHelpers.LookAlong(dir);
+                _att.Target = HasRollRef
+                    ? MathHelpers.LookAlong(dir, RollRef)
+                    : MathHelpers.LookAlong(dir);
                 _att.Update();
 
                 AngleDeg = MathHelpers.AngleBetween(_ship.Forward, dir) * 180.0 / Math.PI;
-                IsAligned = AngleDeg <= AlignedToleranceDeg;
+                RollDeg = HasRollRef ? MeasureRollDeg(dir) : 180.0;
+                // With a reference set, "aligned" has to mean the roll landed too -- the caller is
+                // holding out for a repeatable attitude, not just a bearing.
+                IsAligned = AngleDeg <= AlignedToleranceDeg
+                         && (!HasRollRef || RollDeg <= RollToleranceDeg);
                 return true;
             }
 

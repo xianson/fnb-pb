@@ -23,6 +23,27 @@ namespace IngameScript
                 return Quaternion.CreateFromAxisAngle(axisF, angle);
             }
 
+            // As above, but with the roll pinned by a reference direction.
+            //
+            // LookAlong(dir) is the SHORTEST-ARC rotation from the nose to dir, so the roll it lands
+            // on is whatever falls out of the geometry -- fine when nothing cares, useless when
+            // something does. A mining rig cares: its drill array cuts a rectangle, and a rectangle
+            // that arrives rotated does not tile with the one cut beside it.
+            //
+            // `up` need not be perpendicular to dir; only its perpendicular component is used. A
+            // reference parallel to dir carries no roll information, so that degenerates back to the
+            // shortest arc rather than snapping to an arbitrary answer.
+            public static Quaternion LookAlong(Vector3D dir, Vector3D up)
+            {
+                if (dir.LengthSquared() < 1e-12) return Quaternion.Identity;
+                dir = Vector3D.Normalize(dir);
+                Vector3D u = up - dir * Vector3D.Dot(up, dir);
+                if (u.LengthSquared() < 1e-9) return LookAlong(dir);
+                u = Vector3D.Normalize(u);
+                MatrixD m = MatrixD.CreateWorld(Vector3D.Zero, dir, u);
+                return Quaternion.CreateFromRotationMatrix(m);
+            }
+
             // Unsigned angle between two world-frame vectors, radians.
             public static double AngleBetween(Vector3D a, Vector3D b)
             {
