@@ -104,12 +104,23 @@ namespace IngameScript
             double _torqueSeed;
             double _torqueObserved;
             bool _torqueCalibrated;
+            bool _torqueHiSample;    // seen a sample at near-saturation authority
             Vector3D _prevOmegaBody;
             bool _havePrevOmega;
             // Per-run decay on the observed peak. Slow: a full flip only shows peak authority briefly.
             public double TorqueObservedDecay = 0.999;
             // Only believe a sample when we are actually asking for most of the available authority.
             public double TorqueSampleCmdMin = 0.5;
+            // BOOTSTRAP GATE. The seed above is the VANILLA gyro; a modded gyro can be tens of times
+            // stronger, and everything downstream sizes itself from the torque we believe we have --
+            // including the min-time law's commanded rate, omega* = sqrt(2*alpha*theta). Underestimate
+            // alpha and the command comes out small, so cmd never reaches TorqueSampleCmdMin, so no
+            // sample is ever taken, so the estimate stays wrong. Measured in flight: a 12,639 t hull
+            // that slews fine by hand crawling at yaw=0.03 against a 1 rad/s cap, approaches timing
+            // out at 600 s. The estimator is peak-hold, so a low-authority sample can only ever RAISE
+            // a bad seed -- never lower a good measurement. Sampling them costs nothing and ratchets
+            // the estimate up until the command is big enough to earn a real one.
+            public double TorqueSampleCmdMinUncal = 0.05;
 
             // ---- Velocity source ----
             // The mod publishes FB_Velocity on the Flight Computer: the SAME IRigidBody.LinearVelocity
@@ -926,7 +937,11 @@ namespace IngameScript
                     // Only while we are commanding most of the authority, or we would be measuring
                     // collisions and pilot input rather than the gyros.
                     double cmd = Math.Max(Math.Abs(_pitch), Math.Max(Math.Abs(_yaw), Math.Abs(_roll)));
-                    if (_hasOverrides && cmd >= TorqueSampleCmdMin)
+                    if (cmd >= TorqueSampleCmdMin) _torqueHiSample = true;
+                    // See TorqueSampleCmdMinUncal: until a real high-authority sample lands, take the
+                    // low ones too. Peak-hold makes that monotone-safe.
+                    double gate = _torqueHiSample ? TorqueSampleCmdMin : TorqueSampleCmdMinUncal;
+                    if (_hasOverrides && cmd >= gate)
                     {
                         Vector3D dW = (omegaBody - _prevOmegaBody) / dt;
                         double mag = dW.Length();
@@ -938,7 +953,9 @@ namespace IngameScript
                                         + ax.Z * ax.Z * _inertiaBody.Z;
                             double tq = mag * iEff;
                             if (tq > _torqueObserved) { _torqueObserved = tq; _torqueCalibrated = true; }
-                            else _torqueObserved *= TorqueObservedDecay;
+                            // Decay only once a full-authority sample has been seen. Eroding a
+                            // bootstrap estimate walks it back toward the seed we are escaping.
+                            else if (_torqueHiSample) _torqueObserved *= TorqueObservedDecay;
                         }
                     }
                 }
@@ -952,6 +969,18 @@ namespace IngameScript
 
             public bool TorqueCalibrated { get { return _torqueCalibrated; } }
             public double TorqueSeed { get { return _torqueSeed; } }
+            public double TorqueObserved { get { return _torqueObserved; } }
+
+            // Carry a measurement across a save or recompile. Without this every reload dropped back
+            // to the vanilla seed, and on a modded gyro that is the whole bug -- a recompile silently
+            // undid a calibrate. Peak-hold semantics: a restored value can only raise the estimate.
+            public void RestoreTorque(double tq)
+            {
+                if (tq <= 0.0 || tq <= _torqueObserved) return;
+                _torqueObserved = tq;
+                _torqueCalibrated = true;
+                _torqueHiSample = true;
+            }
 
             // ---------- Per-run command application ----------
 

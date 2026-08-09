@@ -168,7 +168,11 @@ namespace IngameScript
                 ((int)_state).ToString(Inv),
                 Fmt(_targetCoord),
                 _hasTarget ? "1" : "0",
-                ((int)_align.Mode).ToString(Inv));
+                ((int)_align.Mode).ToString(Inv),
+                // The measured gyro torque. Everything downstream sizes itself from this, and the
+                // cold-start seed is the VANILLA gyro -- on a modded one it can be tens of times low.
+                // Without this line a recompile or world reload silently undid a `calibrate`.
+                (_ship.TorqueCalibrated ? _ship.TorqueObserved : 0.0).ToString("R", Inv));
         }
 
         void LoadStorage()
@@ -185,6 +189,10 @@ namespace IngameScript
             int m;
             if (TryParseI(p[3], out m))
                 _align.Mode = (RotationMode)m;
+            // Optional 5th field; absent on saves written by older versions.
+            double tq;
+            if (p.Length >= 5 && TryParseD(p[4], out tq))
+                _ship.RestoreTorque(tq);
             // A saved Goto cannot resume mid-profile: the closer's phase state is not persisted.
             if (_state == ApState.Goto) _state = ApState.Idle;
             // Nor can a Calibrate. The calibrator itself is not persisted, so restoring this state
@@ -653,6 +661,12 @@ namespace IngameScript
                 _ship.ThrottleForward = 0.0;
                 _ship.StrafeRight = 0.0;
                 _ship.StrafeUp = 0.0;
+                // HOLD STATION WHILE TURNING. Zeroing the thrust axes is not the same as stopping:
+                // DampenersWanted is sticky and the closer leaves it false for its powered phases, so
+                // Align inherited "dampeners off" and the ship coasted on its arrival velocity through
+                // the whole slew -- observed drifting sideways and forward off a mining entry point.
+                // Align is rotation-only by design, which makes SE's own damping exactly right here.
+                _ship.DampenersWanted = true;
                 // No usable reference (Prograde at rest, Gravity in space, GPS with no target): release
                 // rather than hold a zero-rate override, which would otherwise lock out the pilot.
                 if (!_align.Update()) _ship.ClearOverrides();
