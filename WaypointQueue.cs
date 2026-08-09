@@ -258,12 +258,23 @@ namespace IngameScript
                     {
                         _idx++;
                         JustAdvancedSubMission = true;
-                        // Carry the committed brake latch across the boundary, as the mod's host does.
-                        SubMission oldSub = _subs[_idx - 1];
-                        SubMission newSub = _subs[_idx];
-                        if (oldSub.Qtrt != null && oldSub.Qtrt.TermFlipDone
-                            && newSub.Qtrt != null)
-                            newSub.Qtrt.RestoreBrakeLatch(oldSub.Qtrt.BrakeLatchSpeed);
+                        // NO BRAKE LATCH ACROSS THE BOUNDARY.
+                        //
+                        // This used to carry the committed latch forward, claiming the mod's host
+                        // does the same. It does not. The mod restores a latch only on RE-ENGAGE of
+                        // a mission whose terminal Stop is unchanged within 1 m -- a pure append
+                        // behind the ship, where the brake already committed for that same terminal
+                        // is still the right commitment. Advancing to the NEXT sub-mission is the
+                        // opposite case: a different terminal, a different distance, a schedule that
+                        // has to be free to decide its own speed.
+                        //
+                        // RestoreBrakeLatch sets _termFlipDone, which makes _brakeLatchSpeed a
+                        // permanent ceiling (vStop = min(vCommitted, _brakeLatchSpeed)) AND pre-skips
+                        // the trigger that would ever re-latch it. So leg 1's commit speed became the
+                        // speed limit for every remaining leg of the route. Measured in flight: a 3 m
+                        // opening waypoint pinned the following 2.3 km to 27 m/s at 15% throttle,
+                        // and legs long enough to matter then outlived a Timeout sized from the
+                        // unrestricted schedule and quit mid-cruise.
                     }
                 }
             }

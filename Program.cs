@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Text;
 using Sandbox.ModAPI.Ingame;
@@ -187,6 +187,12 @@ namespace IngameScript
                 _align.Mode = (RotationMode)m;
             // A saved Goto cannot resume mid-profile: the closer's phase state is not persisted.
             if (_state == ApState.Goto) _state = ApState.Idle;
+            // Nor can a Calibrate. The calibrator itself is not persisted, so restoring this state
+            // put a null _cal on the Tick path and the first run threw an NRE that kills the whole
+            // script. Save or recompile while calibrating and the block came back dead.
+            if (_state == ApState.Calibrate) _state = ApState.Idle;
+            // Nothing is engaged on a fresh load, whatever the state said.
+            _wantEngage = false;
         }
 
         public void Main(string argument, UpdateType updateSource)
@@ -203,7 +209,15 @@ namespace IngameScript
             if (!string.IsNullOrEmpty(argument))
             {
                 Tag("arg");
+                string faultBefore = _fault;
                 HandleArgument(argument);
+                // A REFUSED COMMAND HAS TO BE VISIBLE IMMEDIATELY.
+                //
+                // Rejections set _fault but leave _state alone, so Autopilot_State keeps reading
+                // Idle/Goto and a caller polling it cannot tell "refused" from "not received yet".
+                // Worse, nothing forced a status write, so while idle the explanation surfaced up to
+                // 50 s later -- long after whoever sent the command had given up on it.
+                if (_fault.Length > 0 && _fault != faultBefore) _statusCountdown = 0;
             }
 
             if (--_cdPollCountdown <= 0)
@@ -521,6 +535,7 @@ namespace IngameScript
                 _fault = "lost ship controller";
                 _ship.ClearOverrides();
                 _state = ApState.Fault;
+                _wantEngage = false;   // mirror: a fault is not still-engaged
                 Runtime.UpdateFrequency = UpdateFrequency.Update100;
                 return;
             }
@@ -545,6 +560,7 @@ namespace IngameScript
                         _fault = "no thrust on drive axis " + _ship.DriveAxisName + " -- run `drive`";
                         _ship.ClearOverrides();
                         _state = ApState.Fault;
+                        _wantEngage = false;
                         Runtime.UpdateFrequency = UpdateFrequency.Update100;
                         return;
                     }
@@ -559,6 +575,7 @@ namespace IngameScript
                             _pendingAhead = 0.0;
                             _ship.ClearOverrides();
                             _state = ApState.Fault;
+                            _wantEngage = false;
                             Runtime.UpdateFrequency = UpdateFrequency.Update100;
                             return;
                         }
@@ -576,6 +593,7 @@ namespace IngameScript
                         _fault = "route rejected: " + e.Message;
                         _ship.ClearOverrides();
                         _state = ApState.Fault;
+                        _wantEngage = false;
                         Runtime.UpdateFrequency = UpdateFrequency.Update100;
                         return;
                     }
@@ -602,6 +620,10 @@ namespace IngameScript
                     // thrust overrides so SE's own damping finishes the stop and the pilot has control.
                     _ship.ClearOverrides();
                     _state = ApState.Arrived;
+                    // MIRROR THE ARRIVAL. Left true, the next FB_Engage=true is not an edge at all
+                    // and the following leg is silently swallowed -- the caller sets the flag,
+                    // nothing happens, and no fault is reported.
+                    _wantEngage = false;
                     Runtime.UpdateFrequency = UpdateFrequency.Update100;
                 }
                 return;
@@ -656,6 +678,12 @@ namespace IngameScript
             RotationMode parsedMode = RotationMode.None;
             bool sawMode = false;
             bool engage = false;
+            // ABSENCE IS NOT A COMMAND. Tracked separately from the value, because the value has to
+            // default to something and "false" is a disengage. A CustomData block with no FB_Engage
+            // line -- a hand-edited config, a field written below the status marker where parsing
+            // stops, a driver that only writes the keys it cares about -- used to read as an order
+            // to stop flying.
+            bool sawEngage = false;
 
             for (int i = 0; i < lines.Length; i++)
             {
@@ -699,6 +727,7 @@ namespace IngameScript
                         break;
                     case "fb_engage":
                         engage = val.Equals("true", StringComparison.OrdinalIgnoreCase) || val == "1";
+                        sawEngage = true;
                         break;
                     case "controller":
                         _controllerHint = val;
@@ -756,11 +785,27 @@ namespace IngameScript
                 }
             }
 
-            if (engage != _wantEngage)
+            if (sawEngage && engage != _wantEngage)
             {
                 _wantEngage = engage;
-                if (engage && _hasTarget) EngageGoto();
-                else if (!engage && _state == ApState.Goto) Disengage("engage cleared");
+                if (engage)
+                {
+                    // ENGAGING WITH A ROUTE MEANS FLY THE ROUTE.
+                    //
+                    // This used to call EngageGoto() unconditionally, which flies ONE leg to
+                    // _targetCoord and wipes _routeText. With a route sitting right there in
+                    // CustomData, that silently replaced the driver's multi-waypoint plan with a
+                    // straight line to whatever target was last set -- typically an align vector
+                    // parked a million metres away. The route is the more specific instruction;
+                    // prefer it, exactly as the mod's engage switch does.
+                    WaypointEntry[] wps;
+                    string rerr;
+                    if (_routeText.Length > 0 && TryParseRoute(_routeText, out wps, out rerr))
+                        EngageRoute(wps);
+                    else if (_hasTarget) EngageGoto();
+                    else _fault = "engage: no route and no target";
+                }
+                else if (_state == ApState.Goto) Disengage("engage cleared");
             }
         }
 
@@ -844,7 +889,16 @@ namespace IngameScript
             sb.Append("FB_TargetCoord = ").Append(_hasTarget ? Fmt(_targetCoord) : "").Append('\n');
             sb.Append("FB_Route = ").Append(_routeText).Append('\n');
             sb.Append("AutoRotate_Mode = ").Append(ModeName(_align.Mode)).Append('\n');
-            sb.Append("FB_Engage = ").Append(_state == ApState.Goto ? "true" : "false").Append('\n');
+            // ECHO THE INTENT, NOT THE MOMENTARY STATE.
+            //
+            // This used to write (_state == Goto). Everything else here is a status field, but
+            // FB_Engage is an INPUT that we parse back in -- so deriving it from _state meant the
+            // script minted "FB_Engage = false" every time it stamped status while Arrived, Align,
+            // Idle or Fault, and then read its own output back as a disengage command. A leg would
+            // be accepted and cancelled from a string the script wrote itself.
+            //
+            // _wantEngage is the mirror of what was actually asked for. Echo that.
+            sb.Append("FB_Engage = ").Append(_wantEngage ? "true" : "false").Append('\n');
             sb.Append("Controller = ").Append(_controllerHint).Append('\n');
             sb.Append("GyroRateCap = ").Append(_cfgGyroRateCap.ToString("0.###", Inv)).Append('\n');
             sb.Append("SplineSamples = ")
@@ -867,6 +921,78 @@ namespace IngameScript
             Me.CustomData = s;
         }
 
+        // ONE SENTENCE SAYING WHAT IT IS DOING AND WHY.
+        //
+        // Every field needed to work this out was already published, and it still took a debug dump
+        // and a lot of arithmetic to answer "why is it sitting there". The fields describe the
+        // machine; this describes the intent. Order matters -- the first true thing is the reason,
+        // because a fault explains a stall better than a throttle reading does.
+        string BuildWhy()
+        {
+            if (_fault.Length > 0) return "FAULT: " + _fault;
+
+            switch (_state)
+            {
+                case ApState.Idle:
+                    return _wantEngage
+                         ? "idle but engage is set -- nothing was accepted; re-issue the goto/route"
+                         : "idle, nothing commanded";
+                case ApState.Calibrate:
+                    return "measuring gyro authority; run `stop` to abandon";
+                case ApState.Arrived:
+                    return "arrived at " + (_targetName.Length > 0 ? _targetName : "target")
+                         + "; holding for the next command";
+                case ApState.Align:
+                    return "turning to " + ModeName(_align.Mode)
+                         + (_targetName.Length > 0 ? " (" + _targetName + ")" : "")
+                         + ", " + _align.AngleDeg.ToString("0", Inv) + " deg off"
+                         + (_align.IsAligned ? " -- aligned, holding" : " -- not flying, rotation only");
+            }
+
+            if (_state != ApState.Goto) return StateName(_state);
+
+            if (_queue == null || _pendingGoto)
+                return "holding, hands off: waiting for a valid velocity sample before the schedule "
+                     + "can be built (this is deliberate, not a stall)";
+            if (_queue.Planning)
+                return "coasting while the route is baked, " + _queue.PlanWorkLeft.ToString(Inv)
+                     + " sample(s) left -- no thrust until it finishes";
+
+            SubMission sub = _queue.CurrentSub;
+            string where = _targetName.Length > 0 ? _targetName : "target";
+            double rem = _ship.StateValid ? (_targetCoord - _ship.Body.Position).Length() : 0.0;
+            string leg = " [leg " + (_queue.CurrentSubMission + 1).ToString(Inv)
+                       + "/" + _queue.SubMissionCount.ToString(Inv) + "]";
+
+            if (sub == null) return "flying to " + where + leg;
+
+            QtrtController q = sub.Qtrt;
+            if (sub.Fine != null)
+                return "closing on " + where + " by RCS, "
+                     + rem.ToString("0", Inv) + " m out, phase "
+                     + FineTranslationController.PhaseName(sub.Fine.CurrentPhase) + leg;
+
+            if (q == null) return "flying to " + where + leg;
+
+            // The two questions that actually get asked: why no thrust, and why the rotation.
+            double align = q.DbgAlignErr * 180.0 / Math.PI;
+            double sched = q.DbgVSched;
+            double along = q.AlongTrackSpeed;
+            string why;
+            if (align > 15.0)
+                why = "TURNING " + align.ToString("0", Inv)
+                    + " deg onto the burn heading; throttle is gated until it is inside 15 deg";
+            else if (sched > along + 0.5) why = "accelerating toward " + sched.ToString("0", Inv) + " m/s";
+            else if (sched < along - 0.5) why = "braking toward " + sched.ToString("0", Inv) + " m/s";
+            else why = "holding " + sched.ToString("0", Inv) + " m/s";
+
+            return why + ", " + rem.ToString("0", Inv) + " m to " + where
+                 + ", now " + along.ToString("0", Inv) + " m/s"
+                 + (Math.Abs(q.DbgCross) > 5.0
+                    ? ", " + q.DbgCross.ToString("0", Inv) + " m off the path" : "")
+                 + leg;
+        }
+
         void AppendStatus(StringBuilder sb)
         {
             sb.Append("Autopilot_State = ").Append(StateName(_state)).Append('\n');
@@ -881,6 +1007,7 @@ namespace IngameScript
             if (rc != null && !_ship.ControllerOnPbGrid) sb.Append(" [SUBGRID]");
             sb.Append('\n');
             sb.Append("DriveAxis = ").Append(_ship.DriveAxisName).Append('\n');
+            sb.Append("Why = ").Append(BuildWhy()).Append('\n');
             if (_driveReport.Length > 0) sb.Append(_driveReport);
             sb.Append("AutoRotate_Aligned = ").Append(_align.IsAligned ? "true" : "false").Append('\n');
             sb.Append("AutoRotate_Angle = ").Append(_align.AngleDeg.ToString("0.0", Inv)).Append('\n');
