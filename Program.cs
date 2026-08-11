@@ -754,12 +754,11 @@ namespace IngameScript
                 _ship.ThrottleForward = 0.0;
                 _ship.StrafeRight = 0.0;
                 _ship.StrafeUp = 0.0;
-                // HOLD STATION WHILE TURNING. Zeroing the thrust axes is not the same as stopping:
-                // DampenersWanted is sticky and the closer leaves it false for its powered phases, so
-                // Align inherited "dampeners off" and the ship coasted on its arrival velocity through
-                // the whole slew -- observed drifting sideways and forward off a mining entry point.
-                // Align is rotation-only by design, which makes SE's own damping exactly right here.
-                _ship.DampenersWanted = true;
+                // Align is attitude-only: translation belongs to whatever is driving the ship
+                // (autopilot route or an external controller riding thruster overrides). Do NOT
+                // touch DampenersWanted here -- forcing it on fights an external translation
+                // controller (e.g. SeMiner), which was observed as crawl/stall/drift off commanded
+                // velocity. Leave dampener state exactly as it was.
                 // No usable reference (Prograde at rest, Gravity in space, GPS with no target): release
                 // rather than hold a zero-rate override, which would otherwise lock out the pilot.
                 if (!_align.Update()) _ship.ClearOverrides();
