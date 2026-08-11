@@ -181,6 +181,9 @@ namespace IngameScript
                 _att.Target = HasRollRef
                     ? MathHelpers.LookAlong(dir, RollRef)
                     : MathHelpers.LookAlong(dir);
+                // The attitude law's forward-error terms cannot see roll; hand it the reference
+                // explicitly so the roll closure runs.
+                _att.RollRefWorld = HasRollRef ? (Vector3D?)RollRef : null;
                 _att.Update();
 
                 AngleDeg = MathHelpers.AngleBetween(_ship.Forward, dir) * 180.0 / Math.PI;

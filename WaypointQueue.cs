@@ -201,6 +201,12 @@ namespace IngameScript
             int _bakeIdx;
             public bool Planning { get { return _bakeIdx < _subs.Length; } }
 
+            // Dead-schedule recovery accounting; see Update.
+            public static int MaxRebuilds = 3;
+            int _rebuilds;
+            public int Rebuilds { get { return _rebuilds; } }
+            public string QueueFault;
+
             // Bake everything now, in one call. The offline A/B harness uses this to reproduce the
             // old single-run bake and diff it against the chunked one.
             public void FinishPlanning()
@@ -251,6 +257,24 @@ namespace IngameScript
                 }
 
                 _subs[_idx].Update(dt);
+                if (_subs[_idx].RebuildWanted)
+                {
+                    if (++_rebuilds > MaxRebuilds)
+                    {
+                        // Loud, not silent: releasing control as "Arrived" here is how a ship ends
+                        // up 300 km out reading done. The host surfaces this as a Fault.
+                        QueueFault = "cannot reach the waypoint: schedule expired "
+                                   + _rebuilds + "x far from the target";
+                        IsDone = true;
+                        return;
+                    }
+                    // Fresh straight leg from where the ship ACTUALLY is to the same endpoint;
+                    // whatever state confused the dead schedule is discarded with it.
+                    _subs[_idx] = new SubMission(Ship, Attitude, new WaypointEntry[]
+                    { WaypointEntry.Stop(Ship.Body.Position), _subs[_idx].LastEntry });
+                    if (_bakeIdx > _idx) _bakeIdx = _idx;
+                    return;
+                }
                 if (_subs[_idx].IsDone)
                 {
                     if (_idx >= _subs.Length - 1) IsDone = true;
@@ -323,13 +347,20 @@ namespace IngameScript
             public static double SplinePerpCutFraction = 0.0;
             // Fine-handoff overhead billed to the ETA.
             public static double FineHandoffSeconds = 2.0;
+            // Furthest from the endpoint the fine closer may be engaged; see Update.
+            public static double FineHandoffMaxM = 2000.0;
             public bool IsDone { get { return _trivial ? _trivialDone : (_fine != null && _fine.IsDone); } }
+            // The schedule expired far from the endpoint; the queue should rebuild this sub.
+            public bool RebuildWanted { get; private set; }
+            public WaypointEntry LastEntry { get { return _lastEntry; } }
+            WaypointEntry _lastEntry;
 
             public SubMission(IShip ship, OrientationController attitude, WaypointEntry[] span)
             {
                 _ship = ship;
                 _attitude = attitude;
                 _endPos = span[span.Length - 1].Position;
+                _lastEntry = span[span.Length - 1];
 
                 double totalLen = 0.0;
                 for (int i = 1; i < span.Length; i++)
@@ -524,8 +555,25 @@ namespace IngameScript
                     return;
                 }
                 _qtrt.Update(dt);
-                if (_qtrt.IsDone)
-                    _fine = new FineTranslationController(_ship, _attitude, _endPos);
+                // Runaway arrested: the schedule failed to brake and the guard is holding the
+                // ship on dampeners. Once it is slow, rebuild this leg from where it actually is
+                // (from rest) -- do not resume the schedule that just sailed past.
+                if (_qtrt.RunawayBraking && _ship.Body.LinearVelocity.Length() < 15.0)
+                {
+                    RebuildWanted = true;
+                    return;
+                }
+                if (_qtrt.IsDone && _fine == null)
+                {
+                    // A Qtrt that DIED (timeout) rather than finished can be anywhere; the fine
+                    // closer must never inherit a leg it cannot close -- it RCS-crawled toward a
+                    // target 289 km away. Far from the endpoint, ask the queue for a rebuild.
+                    double dist = (_endPos - _ship.Body.Position).Length();
+                    if (dist <= FineHandoffMaxM)
+                        _fine = new FineTranslationController(_ship, _attitude, _endPos);
+                    else
+                        RebuildWanted = true;
+                }
             }
 
             // Seconds for this sub from a v=0 start.

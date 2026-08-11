@@ -119,6 +119,33 @@ namespace IngameScript
             public static double PartialFlipMaxDepth = 0.6;
             public static double PartialFlipFeasMargin = 0.7;
             public static double PartialFlipMaxGravFrac = 0.05;
+            // Nose demands under this fraction of drive authority hold the fallback nose instead
+            // of steering toward the demand's direction; see the call site.
+            public static double NoseDemandFloorFrac = 0.05;
+            // Fraction of the main drive the flight PLAN is baked against. Sneak mode sets this to
+            // the FLOOR fraction: every speed and brake commit assumes only the quiet drive, so
+            // the terminal is always flyable at low signature.
+            public static double ThrustFrac = 1.0;
+            // Sneak envelope: received signature at an observer scales as thrust/d^2, and the
+            // observers sit at the leg's endpoints. Throttle is held to the floor near BOTH ends
+            // and released quadratically with distance from the nearest one -- what either
+            // endpoint sees stays roughly flat and low while the loud burn happens mid-leg, far
+            // from everyone. The schedule stays floor-baked, so the extra mid-leg authority only
+            // ever arrives EARLY at speeds the quiet drive can still brake from.
+            public static double SneakRampM = 4000.0;
+            // Target-sweep rate below which the rate-track branch stays off and the min-time law
+            // owns the nose (rad/s). See the phiDot gate.
+            public static double OmegaTrackMinSweep = 0.002;
+            // Minimum path curvature (1/m) for the rate-track branch to own the nose. Speed-
+            // INDEPENDENT, unlike the phiDot gate. ~1e-4 = a 10 km radius; real corners far
+            // exceed it, straight-leg numerical noise (~1e-5) never reaches it.
+            public static double CurvatureTrackMin = 1.0e-4;
+            // Hard ceiling on scheduled cruise speed (m/s). 0 = UNCAPPED (default): the target
+            // server's world limit is 50k and a low cap would waste it. This is a per-world SAFETY
+            // knob, not a shipped limit -- set `maxspeed` on a world where a long leg would
+            // otherwise accelerate past the hull's flip-brake capability and run away. The
+            // speed-agnostic RunawayGuard below is the real containment. See BuildSchedule.
+            public static double MaxCruiseSpeed = 0.0;   // no cap: the schedule flies at the hull's own flip-brake-feasible speed
             // Flip coast reserved before a brake, in units of the bang-bang 180 slew time.
             public static double FlipReserveFactor = 2.0;
             public static double TermFlipFactor = 1.4;
@@ -137,7 +164,6 @@ namespace IngameScript
             public static double FlipEnterErrRad = 40.0 * Math.PI / 180.0;
             public static double FlipExitErrRad = 12.0 * Math.PI / 180.0;
             public static double FlipRelatchRad = 20.0 * Math.PI / 180.0;
-
             // Latched flip aim point (world unit vector) + state.
             Vector3D _flipNose; bool _flipLatched;
 
@@ -219,6 +245,12 @@ namespace IngameScript
                 return (-tFlip + Math.Sqrt(disc)) * aMax;
             }
 
+            // Runaway guard: receding-from-target dwell + latch. See Update.
+            public static double RunawaySeconds = 6.0;
+            public static double RunawayMinDistM = 3000.0;
+            double _recedeS;
+            public bool RunawayBraking;
+
             // Telemetry/labels.
             public string DbgPhase = "init";
             public double DbgVSched, DbgAlignErr;
@@ -226,6 +258,15 @@ namespace IngameScript
             // PRODUCTION state, not diagnostic: cross-track offset (m) and along-track speed (m/s).
             public double DbgCross;
             public double AlongTrackSpeed;
+            // Brake-execution diagnostic: the retrograde tangential demand actually applied, the cap the
+            // perpendicular demand leaves for it, and the perpendicular demand magnitude. If aPerp
+            // squeezes aTanCap so aTan can't reach the commanded -aMax, the nose never flips.
+            public double DbgAtan, DbgAtanCap, DbgAperp;
+            // Flip hand-off diagnostic: lead-point curvature, the OmegaTrack rate-track feedforward
+            // magnitude (-1 = null/min-time), and the gyro command magnitude the OrientationController
+            // actually produced this tick. If the nose is 180 off, OmegaTrack is null, yet GyroCmd is 0,
+            // the command is being dropped downstream; if GyroCmd is nonzero, the plant/gyro is.
+            public double DbgKLead, DbgOmegaTrackMag, DbgGyroCmd;
 
             public QtrtController(IShip ship, OrientationController att,
                                   CatmullRomSpline spline, TerminalKind terminal,
@@ -259,7 +300,7 @@ namespace IngameScript
 
                 // Engage snapshot. wAtt is reused rather than re-read: MaxTorque is re-measured every
                 // run, so a live re-read partway through a chunked bake would shift the schedule.
-                double aMax = _ship.MaxForwardThrust * _ship.Body.InvMass * TackCos;
+                double aMax = _ship.MaxForwardThrust * _ship.Body.InvMass * TackCos * ThrustFrac;
                 if (aMax < 1e-6) aMax = 1e-6;
                 _bkAMax = aMax;
                 _bkAtt = wAtt;
@@ -532,7 +573,35 @@ namespace IngameScript
             void BuildSchedule(double aMax)
             {
                 const double VFLOOR = 8.0;     // never schedule below this (avoid creep stalls)
-                double vCruiseMax = Math.Sqrt(Math.Max(0.0, aMax * _totalLen));
+
+                // Sneak: per-sample drive authority, quiet at both endpoints and full mid-leg
+                // (see SneakRampM). Baking the envelope into BOTH passes is what makes the
+                // profile low-LOUD-low instead of quiet-everywhere: the accel pass may climb
+                // hard mid-leg, and the brake pass guarantees the run-in to the endpoint is
+                // flyable on the quiet floor alone. aMax arrives floor-scaled; recover full.
+                double[] envA = null;
+                if (ThrustFrac < 1.0 && ThrustFrac > 1e-6)
+                {
+                    double full = aMax / ThrustFrac;
+                    envA = new double[_nSamp];
+                    for (int i = 0; i < _nSamp; i++)
+                    {
+                        double dNear = Math.Min(_sSamp[i], Math.Max(0.0, _totalLen - _sSamp[i]));
+                        double x = SneakRampM > 1.0 ? dNear / SneakRampM : 1.0;
+                        if (x > 1.0) x = 1.0;
+                        envA[i] = full * (ThrustFrac + (1.0 - ThrustFrac) * x * x);
+                    }
+                }
+
+                double vCruiseMax = Math.Sqrt(Math.Max(0.0,
+                    (envA != null ? aMax / ThrustFrac : aMax) * _totalLen));
+                // HARD CRUISE CEILING. Without it a long leg plans to accelerate to
+                // sqrt(a*L) -- 400+ m/s on a 320 km leg -- and a slow-flip hull cannot turn
+                // retrograde to brake from that: it sails past the target and runs away (observed
+                // 221 km -> 322 km, receding at 727 m/s on a HighSpeed-mod world where physical
+                // velocity clamps its REPORT to 300 but the ship truly moves faster). Cap the
+                // schedule at a speed the hull can reliably flip-and-brake from. 0 = uncapped.
+                if (MaxCruiseSpeed > 1.0 && vCruiseMax > MaxCruiseSpeed) vCruiseMax = MaxCruiseSpeed;
                 // 1) pointwise curvature cap, clamped to the cruise ceiling.
                 double omegaMax = _bkEffOmega;
                 for (int i = 0; i < _nSamp; i++)
@@ -579,7 +648,7 @@ namespace IngameScript
                     double ds = _sSamp[i + 1] - _sSamp[i];
                     double vNext = _vSamp[i + 1];
                     double aCentNext = _kSamp[i + 1] * vNext * vNext;
-                    double aDr = aDrive != null ? aDrive[i + 1] : aMax;
+                    double aDr = envA != null ? envA[i + 1] : (aDrive != null ? aDrive[i + 1] : aMax);
                     double aTanAvail = Math.Sqrt(Math.Max(0.0, aDr * aDr - aCentNext * aCentNext));
                     if (aTanAvail < 0.05 * aMax) aTanAvail = 0.05 * aMax;
                     if (gAlong != null)
@@ -615,8 +684,8 @@ namespace IngameScript
                 for (int i = 1; i < _nSamp; i++)
                 {
                     double ds = _sSamp[i] - _sSamp[i - 1];
-                    double aAcc = aMax;
-                    if (aDrive != null)
+                    double aAcc = envA != null ? envA[i] : aMax;
+                    if (aDrive != null && envA == null)
                     {
                         aAcc = aDrive[i] + gAlong[i];
                         if (aAcc < 0.05 * aMax) aAcc = 0.05 * aMax;
@@ -888,6 +957,21 @@ namespace IngameScript
                 Vector3D tangent = tanRaw.LengthSquared() > 1e-12 ? Vector3D.Normalize(tanRaw) : -_ship.Forward;
                 double remaining = Math.Max(0.0, ArcRemainingAt(_u));
 
+                // Sneak thrust envelope; see SneakRampM. envFrac multiplies the throttle WRITE, so
+                // the physical burn obeys it; aMax/aBrake carry it so the demands stay consistent.
+                double envFrac = 1.0;
+                if (ThrustFrac < 1.0)
+                {
+                    double sDone = InterpAt(_u, _sSamp);
+                    double dNear = Math.Min(sDone, remaining);
+                    double x = SneakRampM > 1.0 ? dNear / SneakRampM : 1.0;
+                    if (x > 1.0) x = 1.0;
+                    envFrac = ThrustFrac + (1.0 - ThrustFrac) * x * x;
+                    aMax = _ship.MaxForwardThrust * rb.InvMass * TackCos * envFrac;
+                    if (aMax < 1e-6) aMax = 1e-6;
+                    aBrake = aMax + (_ship.SportMode ? Math.Max(0.0, _ship.BrakeDragDecel) : 0.0);
+                }
+
                 Vector3D endCP = _spline.ControlPoints[_spline.ControlPoints.Length - 1];
 
                 // ---- gravity-descent latch (planet landing) -------------------------
@@ -932,6 +1016,32 @@ namespace IngameScript
 
                 // ---- terminal handoff (vacuum Stop) ---------------------------------
                 double distEnd = (endCP - pos).Length();
+
+                // RUNAWAY GUARD (speed-agnostic, so it works on a 50k-limit server). If the ship
+                // is moving AWAY from the endpoint and getting FURTHER for several seconds, the
+                // terminal brake has failed to arrest it -- the flip-to-brake stalled at cruise
+                // and it is receding (observed 221 km -> 322 km at 727 m/s). Cutting throttle and
+                // asking dampeners to brake stops the bleed; RunawayBraking then reports up so the
+                // host faults and the queue rebuilds from rest, rather than sailing to infinity.
+                // Positive = moving AWAY from the endpoint (receding).
+                double recedeRate = -Vector3D.Dot(v, Vector3D.Normalize(endCP - pos + new Vector3D(1e-9)));
+                if (_terminal == TerminalKind.Stop && distEnd > RunawayMinDistM && recedeRate > 5.0)
+                {
+                    _recedeS += dt;
+                    if (_recedeS >= RunawaySeconds)
+                    {
+                        _ship.ThrottleForward = 0.0; _ship.StrafeRight = 0.0; _ship.StrafeUp = 0.0;
+                        _ship.DampenersWanted = true;
+                        _att.ResetTracking();
+                        _flipLatched = false;
+                        RunawayBraking = true;
+                        DbgPhase = "runaway-brake";
+                        _att.Update();
+                        return;
+                    }
+                }
+                else _recedeS = 0.0;
+
                 double handoffWindow = Math.Max(80.0, speed * 1.5);
                 bool pathExhausted = _u >= segCount - 1e-3 || remaining < handoffWindow;
                 // GRAVITY-DESCENT DEADLOCK release: stopped outside the hover radius.
@@ -1124,10 +1234,12 @@ namespace IngameScript
                     if (capArrest < aPerpCap) aPerpCap = capArrest;
                 }
                 if (aPerpMag > aPerpCap && aPerpMag > 1e-9) { aPerp *= aPerpCap / aPerpMag; aPerpMag = aPerpCap; }
+                DbgAperp = aPerpMag;
 
                 // Tangential budget left after the perpendicular demand (one drive vector).
                 double aTanCap = Math.Sqrt(Math.Max(0.0, aMax * aMax - aPerpMag * aPerpMag));
                 if (aTan > aTanCap) aTan = aTanCap; else if (aTan < -aTanCap) aTan = -aTanCap;
+                DbgAtanCap = aTanCap;
 
                 // ---- PARTIAL-FLIP corner brake ---------------------------------------
                 // Ease the tangential retrograde brake in gradually so a shallow carry-through brake
@@ -1161,7 +1273,19 @@ namespace IngameScript
                 // ---- braking near a Stop terminal: freeze the retrograde axis --------
                 bool hardBrake = _terminal == TerminalKind.Stop && aTan < -0.5 * aMax && remaining < speed * 3.0;
 
-                Vector3D aDesired = aTan * tangent + aPerp;
+                // THE NOSE ONLY CHASES WHAT THE LATERAL RCS CANNOT DELIVER. aPerp is serviced by
+                // ApplyLateral below regardless of where the nose points, so steering the drive
+                // axis into a demand the strafe thrusters already cover buys nothing -- and on a
+                // slew-limited hull it costs a minute of gated-throttle turning every time the
+                // cross-track PD flicks. Measured on the 39.5 kt miner: nose swung 11 -> 99 deg
+                // after every burn to chase 0.14 m/s^2 of cross correction that 0.46 m/s^2 of RCS
+                // was already delivering; the leg ran at a ~2% burn duty cycle. Only the excess
+                // beyond RCS authority tilts the nose.
+                double aLatAuth = _ship.MaxLateralThrust * rb.InvMass;
+                DbgAtan = aTan;
+                Vector3D aDesired = aTan * tangent;
+                if (aPerpMag > aLatAuth && aPerpMag > 1e-9)
+                    aDesired += aPerp * ((aPerpMag - aLatAuth) / aPerpMag);
 
                 // ---- TACK: hold the drive off the track ------------------------------
                 // Applied LAST and as a pure rotation, so the magnitude the caps above negotiated is
@@ -1172,7 +1296,11 @@ namespace IngameScript
                 // nose error, the cone's precession spends part of that budget on tracking lag, and a
                 // brake that gates its own throttle off does not recover. Ramped, because a step back
                 // to zero is itself a 30 deg jump that would trip the same gate.
-                double tackWant = (hardBrake || _termArrest) ? 0.0 : TackAngleRad;
+                // Sneak keeps the cant through the committed brake: the brake plume is the one
+                // that shines at the DESTINATION, and the arrest phase is most of the brake. The
+                // hardBrake terminal still straightens -- by then the envelope has the drive at
+                // the quiet floor anyway.
+                double tackWant = (hardBrake || (_termArrest && ThrustFrac >= 1.0)) ? 0.0 : TackAngleRad;
                 double tackStep = TackFadeRate * dt;
                 if (_tackCur < tackWant) _tackCur = Math.Min(tackWant, _tackCur + tackStep);
                 else if (_tackCur > tackWant) _tackCur = Math.Max(tackWant, _tackCur - tackStep);
@@ -1199,7 +1327,15 @@ namespace IngameScript
                         // speeds the azimuth up by 1/(1-bias) at its far side, and this cancels it
                         // exactly, so PEAK nose rate is constant across the whole bias range. Without
                         // it, a high bias slews the nose fast enough to trip the brake gate.
-                        _tackPhase += 2.0 * Math.PI * dt * (1.0 - bias) / Math.Max(1.0, TackConeSeconds);
+                        //
+                        // FROZEN DURING LARGE SLEWS. The cone only earns its precession while the
+                        // drive is lit; sweeping the aim through a gated flip drags the target
+                        // around at ~0.05 rad/s and a slow hull can never catch the pin -- measured
+                        // live: a 150 deg turn crawling at 1 deg per 40 s while the ship drifted
+                        // away at 150 m/s. Advance the azimuth only when the nose is close enough
+                        // that the throttle gate could open.
+                        if (_att.LastAngleRad < 0.35)
+                            _tackPhase += 2.0 * Math.PI * dt * (1.0 - bias) / Math.Max(1.0, TackConeSeconds);
                         if (_tackPhase > 2.0 * Math.PI) _tackPhase -= 2.0 * Math.PI;
                         Vector3D dir = Vector3D.Normalize(aDesired);
                         // bias=0 -> unit circle, mean lateral zero. bias=1 -> phase frozen, lat = 2*U,
@@ -1225,8 +1361,21 @@ namespace IngameScript
                 }
                 else fallback = aTan >= 0.0 ? tangent : -tangent;
 
+                // A demand the drive cannot meaningfully act on must not steer the nose. The nose
+                // command is the DIRECTION of aDesired, so when the schedule is satisfied and only
+                // residual cross-track PD noise is left, the "demand" points perpendicular -- and a
+                // slew-limited hull spends a minute turning toward it with the throttle gated, then
+                // a minute turning back. Measured on the 39.5 kt miner: 1-2 s burn dabs at a ~2%
+                // duty cycle, the leg flown at 28 m/s. Below the floor hold the phase's fallback
+                // nose (pro/retrograde); ApplyLateral still services the perpendicular via RCS.
                 Vector3D nose; double thr;
-                MathHelpers.GravityCompensatedCommand(aDesired, gravity, aMax, fallback, out nose, out thr);
+                if (gravity.LengthSquared() < 1e-8 && aDesired.Length() < NoseDemandFloorFrac * aMax)
+                {
+                    nose = fallback;
+                    thr = 0.0;
+                }
+                else
+                    MathHelpers.GravityCompensatedCommand(aDesired, gravity, aMax, fallback, out nose, out thr);
                 _att.Target = MathHelpers.LookAlong(nose);
 
                 // ---- attitude rate-track feedforward ---------------------------------
@@ -1235,12 +1384,30 @@ namespace IngameScript
                 Quaternion invO = Quaternion.Conjugate(rb.Orientation);
                 // SIGN: +leadBin, not -leadBin. Looks like it should be negated, but this is the
                 // convention the rate-track branch consumes; flipping it anti-damps the loop.
-                if (phiDot > 1e-6 && leadBin.LengthSquared() > 1e-12)
+                // THE GATE IS A SWEEP RATE, NOT AN EPSILON. kLead on a numerically "straight"
+                // Catmull-Rom leg carries curvature noise ~1e-7, so at cruise speed phiDot crossed
+                // 1e-6 from noise alone and the proportional rate-track branch preempted the
+                // min-time law on straight legs -- the same straight-leg trap as the mod's
+                // OmegaTrack=Zero bug, resurfacing through the curvature path. On the 39.5 kt
+                // miner that pinned every slew to bandwidth*angle ~ 0.01 rad/s: measured omega
+                // plateaus at 0.012 while the plant could do 15x that. Below a sweep the hull
+                // would not even notice, the min-time law owns the nose.
+                // GATE ON CURVATURE ITSELF, not curvature*speed. phiDot = kLead*speed, so a
+                // sweep-rate gate is SPEED-DEPENDENT: numerical curvature noise (~1e-5) that is
+                // harmless at 140 m/s crosses 0.002 at ~686 m/s and the rate-track branch preempts
+                // the terminal FLIP -- the nose never reaches retrograde, throttle stays gated, and
+                // the ship sails through the target at ~1 km/s (measured live, 4 km closest on a
+                // 400 km leg). A real corner has kLead >> CurvatureTrackMin; a straight leg's noise
+                // never does, at ANY speed. Require real curvature AND a meaningful sweep.
+                if (kLead > CurvatureTrackMin && phiDot > OmegaTrackMinSweep
+                    && leadBin.LengthSquared() > 1e-12)
                     _att.OmegaTrack = Vector3D.Transform(phiDot * leadBin, invO);
                 else
                     // null, NOT Vector3D.Zero: Zero is a value, so OmegaTrack.HasValue stays true and
                     // the rate-track branch keeps preempting the min-time law on a straight leg.
                     _att.OmegaTrack = null;
+                DbgKLead = kLead;
+                DbgOmegaTrackMag = _att.OmegaTrack.HasValue ? _att.OmegaTrack.Value.Length() : -1.0;
                 _att.TrackErrGain = AttitudeBandwidth();
                 _att.RollDeadbandScale = kLead > 1e-9 ? 0.0 : 1.0;
 
@@ -1266,9 +1433,12 @@ namespace IngameScript
                 // ---- LARGE-SLEW FLIP LATCH -> the torque-aware bang-bang law ----------
                 // The rate-track branch preempts the other laws whenever OmegaTrack has a value, so a
                 // big slew on a near-straight leg must clear it to reach the min-time law.
+                // null means the rate-track branch is OFF (straight leg) -- zero sweep, the
+                // strongest case FOR the latch. MaxValue here disabled the flip latch on exactly
+                // the legs that need it, leaving the nose to wobble with aPerp through the slew.
                 double sweepSq = _att.OmegaTrack.HasValue
                     ? _att.OmegaTrack.Value.LengthSquared()
-                    : double.MaxValue;
+                    : 0.0;
                 bool flipEligible = FlipBangBangHandoff
                     && sweepSq <= FlipHandoffSweepMax * FlipHandoffSweepMax;
                 if (!flipEligible)
@@ -1296,13 +1466,17 @@ namespace IngameScript
                     _att.Target = MathHelpers.LookAlong(_flipNose);
                     _att.OmegaTrack = null;
                 }
-                _ship.ThrottleForward = thr * thrGate;
+                // envFrac converts "fraction of the derated budget" back to physical throttle:
+                // thr is normalised by the enveloped aMax, and the drive itself is not derated.
+                _ship.ThrottleForward = thr * thrGate * envFrac;
 
                 // ---- lateral RCS: deliver the perpendicular demand the nose can't cover
                 ApplyLateral(aPerp);
 
                 DbgPhase = aTan < -0.5 * aMax ? "brake" : (aTan > 0.5 * aMax ? "accel" : "track");
                 _att.Update();
+                DbgGyroCmd = Math.Sqrt(_ship.Pitch * _ship.Pitch
+                                     + _ship.Yaw * _ship.Yaw + _ship.Roll * _ship.Roll);
             }
 
             // Max speed at u0 that can still brake to every upcoming curvature/stop cap.

@@ -59,7 +59,20 @@ namespace IngameScript
             public static double TerminalLatchAngleRad = 1.0 * Math.PI / 180.0;
             public static double TerminalLatchRate = 0.05;   // rad/s
 
+            // DEBUG HOOK (harness only, strip before release): (angleRad, aU, |aDes|, |dw|, |omega|).
+            public static Action<double, double, double, double, double> TraceMinTime;
+
             public Vector3D? OmegaTrack = null;     // planned body-frame rate (rad/s); null = off
+
+            // World direction the ship's UP should lean toward. The forward-error laws below are
+            // BLIND to roll about the forward axis -- cross(target, forward) has no forward
+            // component -- so a roll reference used to be measured and reported but never acted
+            // on: RollErr sat at 26.8 deg for seven minutes with the aim at exactly 0. This is
+            // the missing closure.
+            public Vector3D? RollRefWorld = null;
+            public double RollGain = 0.6;           // rad/s of command per rad of roll error
+            public double RollRateCap = 0.25;       // rad/s
+            public double RollDeadbandRad = 0.02;
             public double TrackErrGain = 1.0;
             public double CommandRateCap = 1.0;
 
@@ -75,6 +88,7 @@ namespace IngameScript
                 OmegaTrack = null;
                 TrackErrGain = 1.0;
                 RollDeadbandScale = 1.0;
+                RollRefWorld = null;
             }
 
             // Pure dead-zone: zero below band, pass through unchanged above.
@@ -288,6 +302,9 @@ namespace IngameScript
                         Vector3D omegaCmd = omegaBody + AccelToRateGap(aDes);
                         // Back to command space (anti-parallel, normalised by the rate cap).
                         control = -omegaCmd / rateCapIP;
+                        if (TraceMinTime != null)
+                            TraceMinTime(angleRad, aU, aDes.Length(),
+                                         AccelToRateGap(aDes).Length(), omegaBody.Length());
                     }
                     else
                     {
@@ -307,6 +324,35 @@ namespace IngameScript
                 {
                     // PD (critically damped at default Kp=1, Kd=2).
                     control = Kp * errorBody + Kd * omegaBody;
+                }
+
+                // ---- roll closure about the forward axis ----
+                // Superimposed on whichever law ran above, but only once the aim is close: rolling
+                // during a big slew spends gyro budget fighting the flip. The command convention is
+                // anti-parallel (see the plant sign notes), so the written component is -omega/cap.
+                if (RollRefWorld.HasValue && angleRad < 0.5)
+                {
+                    Vector3D fwdW = currentFwd;
+                    Vector3D wantUp = RollRefWorld.Value - fwdW * Vector3D.Dot(RollRefWorld.Value, fwdW);
+                    Vector3D upW = Vector3D.Transform(Vector3D.Up, rb.Orientation);
+                    Vector3D haveUp = upW - fwdW * Vector3D.Dot(upW, fwdW);
+                    if (wantUp.LengthSquared() > 1e-9 && haveUp.LengthSquared() > 1e-9)
+                    {
+                        wantUp = Vector3D.Normalize(wantUp);
+                        haveUp = Vector3D.Normalize(haveUp);
+                        double rollAng = Math.Atan2(
+                            Vector3D.Dot(Vector3D.Cross(haveUp, wantUp), fwdW),
+                            Vector3D.Dot(haveUp, wantUp));
+                        if (Math.Abs(rollAng) > RollDeadbandRad)
+                        {
+                            double wRoll = RollGain * rollAng;
+                            if (wRoll > RollRateCap) wRoll = RollRateCap;
+                            else if (wRoll < -RollRateCap) wRoll = -RollRateCap;
+                            double capR = CommandRateCap > 1e-6 ? CommandRateCap : 1.0;
+                            Vector3D fwdBody = Vector3D.Transform(fwdW, invOrient);
+                            control -= fwdBody * (wRoll / capR);
+                        }
+                    }
                 }
 
                 // Clamp to [-1,1], then deadband (after clamp, so the band is in command units).

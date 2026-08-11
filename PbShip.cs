@@ -57,6 +57,8 @@ namespace IngameScript
             MatrixD _refMatrix;
             Vector3D _position, _linearVelocity, _physicalVelocity, _angularVelocity;
             Quaternion _orientation = Quaternion.Identity;
+            Quaternion _prevOrientation = Quaternion.Identity;
+            bool _haveOrientationHist;
             Vector3D _forward = -Vector3D.UnitZ;
             Vector3D _gravity;
             Vector3D _inertiaBody = Vector3D.One;
@@ -144,6 +146,17 @@ namespace IngameScript
             public int MaxConsecutiveRejects = 3;      // then accept, so a real discontinuity recovers
             public double MinDtSeconds = 0.008;
 
+            // ---- LIVE velocity-estimator diagnostics (VelDbg status block) ----
+            // A HighSpeed-mod world advances the grid by teleport, so raw position-diff velocity
+            // oscillates 0 / huge-spike and the spike gate rejects most of it -- the estimate then
+            // lags/under-reads and mistimes the terminal brake. These expose exactly that, live.
+            public double DbgRaw;          // last raw (pos-diff) speed
+            public double DbgBound;        // last spike-gate bound
+            public double DbgEstSpeed;     // resulting smoothed estimate speed
+            public long DbgRejects, DbgAccepts;
+            public int DbgRejectRun;
+            public double DbgMaxRaw, DbgMinRaw = 1e18;   // spread of raw over the run
+
             public PbShip(IMyGridTerminalSystem gts, IMyProgrammableBlock me, Action<string> log)
             {
                 _gts = gts;
@@ -169,6 +182,7 @@ namespace IngameScript
                 _haveVel = false;
                 _velSamples = 0;
                 _rejectRun = 0;
+                _haveOrientationHist = false;   // don't difference across the idle gap
             }
             // The mod's reading is good immediately. The fallback needs two accepted samples: the
             // first is a bare difference, the second has been through the EMA, and the flip/brake
@@ -289,6 +303,25 @@ namespace IngameScript
                 rotOnly.Translation = Vector3D.Zero;
                 _orientation = Quaternion.CreateFromRotationMatrix(rotOnly);
 
+                // Angular velocity by differencing the pose, mirroring the linear estimator:
+                // GetShipVelocities under-reads fast rotation ~10-30x, but the WorldMatrix the mod
+                // teleports is exact. Overwrites the sensor read above with the derived world-frame rate.
+                if (_haveOrientationHist && dt > 1e-6)
+                {
+                    Quaternion qd = _orientation * Quaternion.Conjugate(_prevOrientation);
+                    if (qd.W < 0f) qd = Quaternion.Negate(qd);   // shortest arc
+                    double sinHalf = Math.Sqrt((double)qd.X * qd.X + (double)qd.Y * qd.Y + (double)qd.Z * qd.Z);
+                    if (sinHalf > 1e-9)
+                    {
+                        double rate = 2.0 * Math.Atan2(sinHalf, (double)qd.W) / dt;
+                        if (rate < 40.0)   // reject an idle-gap jump; no real spin is near 40 rad/s
+                            _angularVelocity = new Vector3D(qd.X, qd.Y, qd.Z) * (rate / sinHalf);
+                    }
+                    else _angularVelocity = Vector3D.Zero;
+                }
+                _prevOrientation = _orientation;
+                _haveOrientationHist = true;
+
                 // Needs _orientation and _inertiaBody, so it runs last.
                 UpdateTorqueEstimate(dt);
                 _stateValid = true;
@@ -316,6 +349,9 @@ namespace IngameScript
 
                 Vector3D raw = (pos - _prevPos) / dt;
                 _prevPos = pos;
+                DbgRaw = raw.Length();
+                if (DbgRaw > DbgMaxRaw) DbgMaxRaw = DbgRaw;
+                if (DbgRaw < DbgMinRaw) DbgMinRaw = DbgRaw;
 
                 if (!_haveVel)
                 {
@@ -329,14 +365,19 @@ namespace IngameScript
                 // grid by teleport rather than smooth integration.
                 double aMax = _maxForwardThrust * _invMass;
                 double bound = (aMax + _gravity.Length()) * dt * SpikeAccelMult + SpikeFloorMps;
+                DbgBound = bound;
                 if ((raw - _linearVelocity).Length() > bound && _rejectRun < MaxConsecutiveRejects)
                 {
                     _rejectRun++;
+                    DbgRejects++;
+                    DbgRejectRun = _rejectRun;
                     return;
                 }
                 _rejectRun = 0;
+                DbgAccepts++;
                 if (!modAuthoritative) _linearVelocity += (raw - _linearVelocity) * VelSmooth;
                 if (_velSamples < 2) _velSamples = 2;
+                DbgEstSpeed = _linearVelocity.Length();
             }
 
             void RefreshInertia()
@@ -362,6 +403,19 @@ namespace IngameScript
                     InertiaAboutAxis(refRightLocal, inertiaGrid),   // pitch
                     InertiaAboutAxis(refUpLocal, inertiaGrid),      // yaw
                     InertiaAboutAxis(refFwdLocal, inertiaGrid));    // roll
+            }
+
+            // Immediate mass/inertia/budget re-read, bypassing the lazy BudgetIntervalRuns cadence, so a
+            // route-start check reads the live hull (a just-dumped hold, a docked-on load) not a stale one.
+            public void ForceBudgetRefresh()
+            {
+                if (_ctrl == null) return;
+                _mass = _ctrl.CalculateShipMass().PhysicalMass;
+                if (!(_mass > 1e-6)) _mass = 1.0;
+                _invMass = 1.0 / _mass;
+                RefreshInertia();
+                RefreshBudgets();
+                _runsSinceBudget = 0;
             }
 
             void RescanBlocks()
@@ -1057,8 +1111,6 @@ namespace IngameScript
                 Vector3D rotationBody = new Vector3D(_pitch, _yaw, _roll) * rateCap;
                 Vector3D rotationWorld = Vector3D.TransformNormal(rotationBody, _refMatrix);
 
-                int cyc = ForceWriteCycle > 0 ? ForceWriteCycle : 1;
-                int phase = _writePhase % cyc;
                 for (int i = 0; i < _gyros.Count && i < _lastGx.Count && i < _gyroOk.Count; i++)
                 {
                     // Enabled/functional is sampled with the torque budget, same cadence, same reason.
@@ -1073,21 +1125,26 @@ namespace IngameScript
                     // aligned, so convert through world space per gyro.
                     Vector3D gl = Vector3D.TransformNormal(rotationWorld, MatrixD.Transpose(g.WorldMatrix));
                     float gx = (float)gl.X, gy = (float)gl.Y, gz = (float)gl.Z;
-                    bool force = i % cyc == phase;
-                    // Compare what was actually WRITTEN, not what was intended: SE's Pitch/Yaw/Roll
-                    // setters do not necessarily hand back the same number they were given.
-                    if (!force && _lastGOn[i] && gx == _lastGx[i] && gy == _lastGy[i] && gz == _lastGz[i])
-                        continue;
-                    if (force || !_lastGOn[i]) { g.GyroOverride = true; _lastGOn[i] = true; _writeCountAccum++; }
-                    if (force || gx != _lastGx[i]) { g.Pitch = gx; _lastGx[i] = gx; _writeCountAccum++; }
-                    if (force || gy != _lastGy[i]) { g.Yaw = gy; _lastGy[i] = gy; _writeCountAccum++; }
-                    if (force || gz != _lastGz[i]) { g.Roll = gz; _lastGz[i] = gz; _writeCountAccum++; }
+                    // ALWAYS re-assert the override AND the rates every tick, exactly like the mod's
+                    // SEShip. The RCS Gyros mod clears GyroOverride mid-leg when it recomputes gyro
+                    // strength; the old write-cache skipped the re-assert (its cached _lastGOn still read
+                    // true), so the override stayed OFF and every rate write was silently swallowed --
+                    // the Pitch/Yaw/Roll setters are gated on GyroOverride -- and the ship stopped
+                    // responding mid-flip and coasted through the target. One bool + three floats per
+                    // gyro per tick is negligible; SEShip has always done exactly this.
+                    g.GyroOverride = true;
+                    g.Pitch = gx; g.Yaw = gy; g.Roll = gz;
+                    _lastGOn[i] = true; _lastGx[i] = gx; _lastGy[i] = gy; _lastGz[i] = gz;
+                    _writeCountAccum += 4;
                 }
             }
 
             void ApplyDampeners()
             {
-                if (_dampenersValid && _dampenersWanted == _dampenersApplied) return;
+                // WRITE EVERY TICK, not just on change. The PB must OWN the dampener state while it runs:
+                // this hull's gyro is powered by the RCS thrusters, and any RCS firing for dampening is
+                // excluded from producing rotation, so a player toggling dampeners on mid-leg would
+                // silently starve the flip. A cached "unchanged" write let that stick; re-assert it.
                 for (int i = 0; i < _controllers.Count; i++)
                 {
                     IMyShipController c = _controllers[i];

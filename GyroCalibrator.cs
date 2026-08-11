@@ -40,10 +40,19 @@ namespace IngameScript
             public double SpinSeconds = 2.5;
             public double SettleSeconds = 1.5;
 
+            // Commanded spin rate during calibration. Kept moderate on purpose: the PB's only velocity
+            // source (GetShipVelocities) under-reads very fast rotation, so a flat-out spin measures far
+            // below the true authority. This stays inside the range the sensor reports accurately.
+            public static double CalibrateRateCap = 1.5;
+
             double _t;
             double _prevOmegaAxis;
             bool _havePrev;
             readonly double[] _peakAlpha = new double[3];
+            // Highest |omega| reached on each axis. The per-tick alpha derivative badly under-reads a
+            // fast ramp (readback lag), so a robust floor is that the ship reached this rate within the
+            // spin window: alpha >= peakOmega / SpinSeconds. Immune to per-tick noise.
+            readonly double[] _peakOmegaAxis = new double[3];
 
             // Driving a gyro to saturation also reveals the world's max angular speed, which is the
             // other constant a PB cannot read (the mod gets it from the environment definition).
@@ -85,6 +94,11 @@ namespace IngameScript
 
                     double om = Math.Abs(omAxis);
                     if (om > _peakOmega) _peakOmega = om;
+                    // Floor uses the WORLD-frame total rate, not the body-axis component: while spinning,
+                    // the body frame rotates with the ship, so the commanded-axis component collapses as
+                    // it tumbles even though the ship is turning fast. The magnitude is frame-invariant.
+                    double omTotal = rb.AngularVelocity.Length();
+                    if (omTotal > _peakOmegaAxis[Axis]) _peakOmegaAxis[Axis] = omTotal;
                     // Still commanding full authority but no longer accelerating: the rate cap binds.
                     if (_peakAlpha[Axis] > 1e-6 && alpha < 0.05 * _peakAlpha[Axis] && om > 0.5 * _peakOmega)
                     {
@@ -95,12 +109,14 @@ namespace IngameScript
                 _prevOmegaAxis = omAxis;
                 _havePrev = true;
 
-                // Hold station while rotating: thrusters are released to 0 override, so SE's own
-                // dampeners keep the ship from wandering during the manoeuvre.
+                // Dampeners OFF while spinning: on an RCS-assisted gyro hull, dampener thrust is
+                // excluded from producing rotation, so holding station starves the spin and the
+                // measured alpha reads far below the real authority. Re-enable only in Settle to
+                // arrest the residual rate/drift between axes. Thrusters stay at 0 override.
                 _ship.ThrottleForward = 0.0;
                 _ship.StrafeRight = 0.0;
                 _ship.StrafeUp = 0.0;
-                _ship.DampenersWanted = true;
+                _ship.DampenersWanted = (CurrentStage == Stage.Settle);
 
                 double cmd;
                 switch (CurrentStage)
@@ -144,7 +160,9 @@ namespace IngameScript
                 for (int a = 0; a < 3; a++)
                 {
                     double inertia = a == 0 ? I.X : (a == 1 ? I.Y : I.Z);
-                    double tq = _peakAlpha[a] * inertia;
+                    // Take the larger of the per-tick peak and the reached-rate floor.
+                    double alpha = Math.Max(_peakAlpha[a], _peakOmegaAxis[a] / Math.Max(SpinSeconds, 1e-3));
+                    double tq = alpha * inertia;
                     if (tq > best) best = tq;
                 }
                 ResultTorque = best;

@@ -84,7 +84,11 @@ namespace IngameScript
         double _cfgGyroRateCap = OrientationController.CommandedRateCapBase;
         double _cfgArrivalDist = -1.0;
         double _cfgGyroTorque;   // 0 = measure it
+        double _cfgMinFlipAlpha = 0.1;   // rad/s^2; both flip axes below it => refuse route. 0.1 = comfortable
+                                          // flip margin above the 0.06 snap-gate floor (config key `minflipalpha`)
         double _tackDeg = 30.0;  // cant used by the tack command
+        bool _sneak;             // every goto/route flies canted at the quiet-floor thrust
+        double _sneakFloor = 0.35;  // planned drive fraction near the leg endpoints
         double _tackBias;        // default bias when the tack argument omits one
         bool _pendingGoto;
         double _pendingAhead;    // >0: a bare-distance goto still waiting for live ship state
@@ -217,6 +221,19 @@ namespace IngameScript
 
             TrackSimSpeed(updateSource);
 
+            // CONFIG BEFORE COMMAND. Callers write CustomData and TryRun in the same breath (the
+            // SeMiner bridge does exactly that), and the engage path snapshots gyro authority into
+            // the schedule bake. Acting on the argument first meant a goto could bake its flip
+            // time from the PREVIOUS config: measured in the harness, a same-run pin + goto
+            // committed the terminal brake at 32 m/s because tFlip came from the vanilla seed,
+            // and the never-re-accelerate latch then pinned the entire 15.7 km leg to it.
+            if (!string.IsNullOrEmpty(argument)) _cdPollCountdown = 0;
+            if (--_cdPollCountdown <= 0)
+            {
+                _cdPollCountdown = CustomDataPollRuns > 0 ? CustomDataPollRuns : 1;
+                SyncCustomData();
+            }
+
             if (!string.IsNullOrEmpty(argument))
             {
                 Tag("arg");
@@ -229,12 +246,6 @@ namespace IngameScript
                 // Worse, nothing forced a status write, so while idle the explanation surfaced up to
                 // 50 s later -- long after whoever sent the command had given up on it.
                 if (_fault.Length > 0 && _fault != faultBefore) _statusCountdown = 0;
-            }
-
-            if (--_cdPollCountdown <= 0)
-            {
-                _cdPollCountdown = CustomDataPollRuns > 0 ? CustomDataPollRuns : 1;
-                SyncCustomData();
             }
 
             Tick(dt);
@@ -340,7 +351,14 @@ namespace IngameScript
                     {
                         // tack flies the identical route; it only holds the drive off the track so
                         // Spectrum's drive lobe never points down it. See QtrtController.TackAngleRad.
-                        QtrtController.TackAngleRad = verb == "tack" ? _tackDeg * Math.PI / 180.0 : 0.0;
+                        // `sneak on` makes every plain goto/route fly canted too, so a caller that
+                        // authors legs generically (SeMiner's return-to-base) can go dark without
+                        // switching verbs.
+                        QtrtController.TackAngleRad = (verb == "tack" || _sneak)
+                            ? _tackDeg * Math.PI / 180.0 : 0.0;
+                        // Sneak also derates the planned drive to the quiet floor; the envelope in
+                        // QtrtController releases the difference mid-leg only.
+                        QtrtController.ThrustFrac = _sneak ? _sneakFloor : 1.0;
                         if (verb == "tack") QtrtController.TackBias = StripTackBias(ref rest);
                         double ahead = 0.0;
                         if (rest.Length > 0)
@@ -367,7 +385,8 @@ namespace IngameScript
                     }
                 case "route":
                     {
-                        QtrtController.TackAngleRad = 0.0;
+                        QtrtController.TackAngleRad = _sneak ? _tackDeg * Math.PI / 180.0 : 0.0;
+                        QtrtController.ThrustFrac = _sneak ? _sneakFloor : 1.0;
                         if (rest.Length == 0) { _fault = "route: no waypoints"; return; }
                         WaypointEntry[] wps;
                         string err;
@@ -381,6 +400,15 @@ namespace IngameScript
                         RotationMode m;
                         if (!AlignController.TryParse(rest, out m)) { _fault = "align: bad mode"; return; }
                         EngageAlign(m);
+                        break;
+                    }
+                case "sneak":
+                    {
+                        string s = rest.Trim().ToLowerInvariant();
+                        if (s == "on" || s == "1" || s == "true") _sneak = true;
+                        else if (s == "off" || s == "0" || s == "false" || s.Length == 0) _sneak = false;
+                        else { _fault = "sneak: on|off"; return; }
+                        // Applies to the NEXT engage; a leg already flying keeps its cant.
                         break;
                     }
                 // ROLL REFERENCE for align. `rollref <coord>` pins the ship's up axis toward a world
@@ -433,6 +461,7 @@ namespace IngameScript
                     _pendingGoto = false;
                     _cal = new GyroCalibrator(_ship);
                     _state = ApState.Calibrate;
+                    ApplyConfigToShip();   // now _state==Calibrate, so the spin runs at the hardware rate cap
                     _fault = "";
                     Runtime.UpdateFrequency = ControlFrequency();
                     break;
@@ -600,6 +629,33 @@ namespace IngameScript
                         Runtime.UpdateFrequency = UpdateFrequency.Update100;
                         return;
                     }
+                    // Flip-authority gate. On a HighSpeed server every route needs a 180-degree
+                    // brake-flip; a hull that cannot rotate hard enough stalls at 180 and runs away
+                    // rather than stopping. The two flip axes are pitch (InertiaBody.X) and yaw
+                    // (InertiaBody.Y) -- roll (Z) is the drive axis and does not reverse the ship. If
+                    // BOTH are below the floor the route is unflippable in every attitude, so refuse
+                    // it. Torque is isotropic, so per-axis alpha = MaxTorque / I_axis.
+                    if (_cfgMinFlipAlpha > 0.0)
+                    {
+                        _ship.ForceBudgetRefresh();   // judge the live hull, not a stale (pre-dump) mass
+                        double tau = _ship.MaxTorque;
+                        Vector3D Ib = _ship.Body.InertiaBody;
+                        double aPitch = tau / Math.Max(Ib.X, 1.0);
+                        double aYaw = tau / Math.Max(Ib.Y, 1.0);
+                        if (aPitch < _cfgMinFlipAlpha && aYaw < _cfgMinFlipAlpha)
+                        {
+                            _fault = "cannot start route: hull can't flip hard enough -- pitch a="
+                                + aPitch.ToString("0.###", Inv) + ", yaw a=" + aYaw.ToString("0.###", Inv)
+                                + " rad/s^2, both under floor " + _cfgMinFlipAlpha.ToString("0.###", Inv)
+                                + (_ship.TorqueCalibrated ? "" : " (torque seeded -- run `calibrate` first)");
+                            _ship.ClearOverrides();
+                            _state = ApState.Fault;
+                            _wantEngage = false;
+                            _pendingGoto = false;
+                            Runtime.UpdateFrequency = UpdateFrequency.Update100;
+                            return;
+                        }
+                    }
                     if (!_ship.DerivedVelocityValid) return;   // hold, hands off, until velocity is real
                     if (_pendingAhead > 0.0)
                     {
@@ -650,6 +706,15 @@ namespace IngameScript
                     }
                 }
                 _ship.ApplyCommands();
+                if (_queue.QueueFault != null)
+                {
+                    _fault = _queue.QueueFault;
+                    _ship.ClearOverrides();
+                    _state = ApState.Fault;
+                    _wantEngage = false;
+                    Runtime.UpdateFrequency = UpdateFrequency.Update100;
+                    return;
+                }
                 if (_queue.IsDone)
                 {
                     // The closer has already asked for dampeners; push that, then release the gyro and
@@ -816,6 +881,11 @@ namespace IngameScript
                         if (TryParseD(val, out ad) && ad > 0.0)
                             _cfgArrivalDist = ad;
                         break;
+                    case "minflipalpha":
+                        double mfa;
+                        if (TryParseD(val, out mfa) && mfa >= 0.0)
+                            _cfgMinFlipAlpha = mfa;
+                        break;
                     case "splinesamples":
                         // CHANGES FLIGHT. 48 is the mod's value and the only mod-identical setting;
                         // lowering it coarsens the speed schedule to buy instruction budget.
@@ -935,7 +1005,11 @@ namespace IngameScript
         void ApplyConfigToShip()
         {
             _ship.ControllerNameHint = _controllerHint;
-            _ship.GyroRateCapOverride = _cfgGyroRateCap;
+            // Calibrate spins at a moderate, sensor-readable rate (not the hardware cap): GetShipVelocities
+            // under-reads very fast rotation, so a flat-out spin measures far below true authority.
+            _ship.GyroRateCapOverride = _state == ApState.Calibrate
+                ? GyroCalibrator.CalibrateRateCap
+                : _cfgGyroRateCap;
             _ship.GyroTorqueOverride = _cfgGyroTorque;
             // Was parsed and echoed back but never reached the closer, so the one documented escape
             // hatch for the absolute-metre arrival constants did nothing.
@@ -979,6 +1053,7 @@ namespace IngameScript
                 ? _cfgGyroTorque.ToString("0", Inv) : "auto").Append('\n');
             if (_cfgArrivalDist > 0.0)
                 sb.Append("ArrivalDist = ").Append(_cfgArrivalDist.ToString("0.#", Inv)).Append('\n');
+            sb.Append("MinFlipAlpha = ").Append(_cfgMinFlipAlpha.ToString("0.###", Inv)).Append('\n');
             sb.Append('\n');
             sb.Append(StatusMarker).Append('\n');
             AppendStatus(sb);
@@ -1091,6 +1166,18 @@ namespace IngameScript
             sb.Append("Speed = ").Append(spd.ToString("0.0", Inv))
               .Append(_ship.UsingModVelocity ? " (FB_Velocity)" : " (derived)").Append('\n');
             sb.Append("PhysicalSpeed = ").Append(rb.PhysicalLinearVelocity.Length().ToString("0.0", Inv)).Append('\n');
+            // LIVE velocity-estimator diagnostics. On a HighSpeed-mod world watch VelRaw oscillate
+            // (0 / spike from teleport) and Rejects climb while the smoothed estimate lags the
+            // real speed -- that lag is what mistimes the terminal brake. Only meaningful on the
+            // derived path (no FB_Velocity).
+            if (!_ship.UsingModVelocity)
+                sb.Append("VelDbg = raw ").Append(_ship.DbgRaw.ToString("0", Inv))
+                  .Append(" [").Append(_ship.DbgMinRaw > 1e17 ? 0 : _ship.DbgMinRaw).Append("..")
+                  .Append(_ship.DbgMaxRaw.ToString("0", Inv)).Append("]  est ")
+                  .Append(_ship.DbgEstSpeed.ToString("0", Inv)).Append("  bound ")
+                  .Append(_ship.DbgBound.ToString("0", Inv)).Append("  rej/acc ")
+                  .Append(_ship.DbgRejects).Append('/').Append(_ship.DbgAccepts)
+                  .Append("  run ").Append(_ship.DbgRejectRun).Append('\n');
             if (_hasTarget)
             {
                 double rem = (_targetCoord - rb.Position).Length();
@@ -1111,10 +1198,22 @@ namespace IngameScript
                     {
                         // The tracker's own state: what it is chasing and how far off the path it is.
                         sb.Append("Sched_Speed = ").Append(q.DbgVSched.ToString("0.0", Inv)).Append('\n');
+                        if (_queue.Rebuilds > 0)
+                            sb.Append("Sched_Rebuilds = ").Append(_queue.Rebuilds.ToString(Inv)).Append('\n');
                         sb.Append("Along_Speed = ").Append(q.AlongTrackSpeed.ToString("0.0", Inv)).Append('\n');
                         sb.Append("CrossTrack = ").Append(q.DbgCross.ToString("0.0", Inv)).Append('\n');
                         sb.Append("AlignErr = ")
                           .Append((q.DbgAlignErr * 180.0 / Math.PI).ToString("0.0", Inv)).Append('\n');
+                        // Brake-execution budget: does the perpendicular demand squeeze the retrograde
+                        // brake to zero? aTan should reach -aMax during a committed brake; if AtanCap
+                        // (= sqrt(aMax^2 - Aperp^2)) collapses, aTan can't, and the nose never flips.
+                        sb.Append("Brake_Atan = ").Append(q.DbgAtan.ToString("0.000", Inv)).Append('\n');
+                        sb.Append("Brake_AtanCap = ").Append(q.DbgAtanCap.ToString("0.000", Inv)).Append('\n');
+                        sb.Append("Brake_Aperp = ").Append(q.DbgAperp.ToString("0.000", Inv)).Append('\n');
+                        // Flip hand-off: lead curvature, OmegaTrack sweep (-1 = null/min-time), gyro cmd.
+                        sb.Append("Flip_KLead = ").Append(q.DbgKLead.ToString("0.0e0", Inv)).Append('\n');
+                        sb.Append("Flip_OmegaTrack = ").Append(q.DbgOmegaTrackMag.ToString("0.0000", Inv)).Append('\n');
+                        sb.Append("Flip_GyroCmd = ").Append(q.DbgGyroCmd.ToString("0.0000", Inv)).Append('\n');
                         if (q.DbgStraightRun != 0) sb.Append("StraightRun = true\n");
                         if (q.TermFlipDone) sb.Append("BrakeCommitted = true\n");
                     }

@@ -53,6 +53,11 @@ namespace IngameScript
 
             // Atmospheric drag decel on the cruise velocity, m/s^2. Not observable from a PB; always 0.
             double BrakeDragDecel { get; }
+
+            // Forces an immediate mass/inertia/thrust/torque re-read. The budget is otherwise refreshed
+            // lazily (~0.5 s cadence), so a check that runs on the first tick after engage -- the flip
+            // gate -- would otherwise judge a stale mass (e.g. a just-emptied hold still reads laden).
+            void ForceBudgetRefresh();
         }
 
         public interface IRigidBody
