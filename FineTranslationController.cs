@@ -116,10 +116,11 @@ namespace IngameScript
                 _hopPeakSpeed = SolveHopPeakSpeed(axis.Length());
                 ArmHopCap();
 
-                // Maneuver select: flip-hop vs flip-free Translate by time estimate.
+                // Maneuver select. Within CloseTranslateM always translate; beyond it, flip-hop vs
+                // translate by time estimate.
                 double tTranslate = EstimateTranslateTime(axis);
                 double tHop = EstimateFlipHopTime(axis.Length());
-                if (tTranslate <= tHop)
+                if (axis.Length() < CloseTranslateM || tTranslate <= tHop)
                     EnterTranslate(StartPosition);
 
                 double tPlanned = Math.Min(tTranslate, tHop);
@@ -145,6 +146,10 @@ namespace IngameScript
             bool _holdValid;
             public double TranslateVelGain = 1.5;
             public double TranslateBrakeMargin = 0.8;
+            // Within this range of the waypoint, always translate (flip-free) instead of flip-hopping:
+            // a hop over the terminal stretch wastes the flip reserve and arrives hot. 2 km covers the
+            // whole fine-handoff range, so the terminal approach is translated end to end.
+            public double CloseTranslateM = 2000.0;
 
             void EnterTranslate(Vector3D pos)
             {
@@ -283,6 +288,14 @@ namespace IngameScript
                 double gateSpeed = Math.Max(speed, physSpeed);
                 double remainingAlongGate = Vector3D.Dot(Target - pos, _lineDir);
                 double distToTarget = (Target - pos).Length();
+
+                // Live rule: once inside CloseTranslateM, translate -- switch out of any hop phase
+                // (Burn/Flip/Brake) into a direct flip-free translate for the terminal approach.
+                if (CurrentPhase != Phase.Done && CurrentPhase != Phase.Translate
+                    && CurrentPhase != Phase.GravityCreep && distToTarget < CloseTranslateM)
+                {
+                    EnterTranslate(pos);
+                }
 
                 double aBrakeDamp = Ship.MaxForwardThrust * rb.InvMass;
                 double dampStopDist = aBrakeDamp > 1e-6
