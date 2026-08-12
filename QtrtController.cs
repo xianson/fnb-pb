@@ -751,6 +751,28 @@ namespace IngameScript
                 double iMax = Math.Max(I.X, Math.Max(I.Y, I.Z));
                 if (iMax < 1.0) iMax = 1.0;
                 double alpha = _ship.MaxTorque / iMax;
+                // BOUND IT THE WAY THE ATTITUDE LAW ACTUALLY BOUNDS ITSELF. Everything cascaded under
+                // this number -- the cross-track loop at CrossLoopSep * wAtt above all -- assumes the
+                // nose can be moved at sqrt(alpha). The min-time law does not command the raw plant
+                // alpha though: it clamps to GyroRateCap/MinSlewSeconds, because acceleration beyond
+                // "reach the rate cap in MinSlewSeconds" is spent overshooting the cap.
+                //
+                // Using the unbounded figure overstates the inner loop and quietly closes the
+                // separation the outer loop depends on. MUNDOZER with MinSlewSeconds = 1.0: plant
+                // alpha 10.97 -> wAtt 3.31 and wCross 1.66, while the achievable alpha is 3.46 ->
+                // wAtt 1.86. An outer loop at 1.66 under an inner one at 1.86 is 1.12:1 -- no
+                // separation at all, and the cross-track correction rotates the demand faster than
+                // the nose can follow it. The nose then chases a spinning vector, which is the
+                // spiral/oscillation seen on straight legs entered with pre-existing lateral
+                // velocity, where the cross-track term dominates aDesired.
+                //
+                // It hid at MinSlewSeconds = 0.25 because the bound (13.8) sat ABOVE the plant alpha
+                // and clipped nothing, leaving a real 2:1.
+                if (OrientationController.MinSlewSeconds > 1e-3)
+                {
+                    double meterable = _ship.GyroRateCap / OrientationController.MinSlewSeconds;
+                    if (meterable > 1e-6 && alpha > meterable) alpha = meterable;
+                }
                 return alpha > 1e-9 ? Math.Sqrt(alpha) : 1e-3;
             }
 
