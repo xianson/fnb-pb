@@ -429,6 +429,11 @@ namespace IngameScript
                         }
                         Vector3D rc;
                         if (!TryParseDestination(r, out rc)) { _fault = "rollref: bad coordinate"; return; }
+                        // Same frozen-state trap goto <distance> had (see TryResolveAhead): before the
+                        // first successful RefreshState, Body.Position reads Vector3D.Zero, and a
+                        // coordinate far from the origin would pass the LengthSquared gate below and
+                        // silently latch a garbage direction instead of refusing.
+                        if (!_ship.StateValid) { _fault = "rollref: no live ship state yet"; return; }
                         Vector3D d = rc - _ship.Body.Position;
                         if (d.LengthSquared() < 1.0) { _fault = "rollref: too close to give a direction"; return; }
                         _align.RollRef = Vector3D.Normalize(d);
@@ -502,13 +507,25 @@ namespace IngameScript
                     _statusCountdown = 0;
                     break;
                 case "rescan":
-                    _ship.ClearOverrides();
-                    _ship = new PbShip(GridTerminalSystem, Me, Echo);
-                    _att = new OrientationController(_ship);
-                    _align = new AlignController(_ship, _att);
-                    ApplyConfigToShip();
-                    _state = ApState.Idle;
-                    break;
+                    {
+                        // A rescan rebuilds the block-reference cache; it must not also throw away
+                        // gyro torque measured by actually flying. That number lives only on the
+                        // PbShip instance, and the only place anything ever restores it is
+                        // LoadStorage() in the constructor -- so before this line, a rescan silently
+                        // dropped back to the cold vanilla seed, and with the flip-authority gate
+                        // (minflipalpha) that then refused every goto/route as "can't flip hard
+                        // enough" until the block was recompiled (which reloads Storage and calls
+                        // RestoreTorque). Carry the live measurement across the swap instead.
+                        double savedTorque = _ship.TorqueCalibrated ? _ship.TorqueObserved : 0.0;
+                        _ship.ClearOverrides();
+                        _ship = new PbShip(GridTerminalSystem, Me, Echo);
+                        _att = new OrientationController(_ship);
+                        _align = new AlignController(_ship, _att);
+                        _ship.RestoreTorque(savedTorque);
+                        ApplyConfigToShip();
+                        _state = ApState.Idle;
+                        break;
+                    }
                 default:
                     _fault = "unknown argument: " + verb;
                     break;
@@ -581,10 +598,31 @@ namespace IngameScript
             _pendingGoto = false;
             _pendingAhead = 0.0;
             _wantEngage = false;
+            RetireRoute();
             _wantMode = RotationMode.None;
             _state = ApState.Idle;
             _fault = "";
             Runtime.UpdateFrequency = UpdateFrequency.Update100;
+        }
+
+        // MIRROR THE ARRIVAL, FOR THE ROUTE TEXT TOO.
+        //
+        // _wantEngage already gets this treatment (see the Arrived branch in Tick) so a stale
+        // FB_Engage=true reads as a fresh edge. _routeText did not, and a stale non-empty route is
+        // worse than a stale flag: ParseCustomData's engage handler prefers a non-empty _routeText
+        // over _hasTarget unconditionally ("ENGAGING WITH A ROUTE MEANS FLY THE ROUTE"). A caller
+        // that engages a follow-up leg with FB_TargetCoord + FB_Engage=true alone -- never touching
+        // FB_Route -- round-trips the PB's own last-echoed FB_Route line straight back unchanged, so
+        // ParseCustomData sees "no change" and never re-parses it, but the engage handler still finds
+        // it non-empty and silently re-flies the PREVIOUS, already-completed route instead of the new
+        // target. Because the ship is already sitting at that route's endpoint, the requeued mission
+        // is a near-zero-length one that "completes" almost instantly -- no fault, no visible motion.
+        // A recompile fixed it only because _routeText is not one of the fields LoadStorage restores,
+        // so a fresh compile starts it empty. Retiring it here, at every point a mission actually
+        // ends, makes that reset happen every time instead of only on recompile.
+        void RetireRoute()
+        {
+            _routeText = "";
         }
 
         // ---------- Control loop ----------
@@ -601,6 +639,7 @@ namespace IngameScript
                 _ship.ClearOverrides();
                 _state = ApState.Fault;
                 _wantEngage = false;   // mirror: a fault is not still-engaged
+                RetireRoute();
                 Runtime.UpdateFrequency = UpdateFrequency.Update100;
                 return;
             }
@@ -626,6 +665,7 @@ namespace IngameScript
                         _ship.ClearOverrides();
                         _state = ApState.Fault;
                         _wantEngage = false;
+                        RetireRoute();
                         Runtime.UpdateFrequency = UpdateFrequency.Update100;
                         return;
                     }
@@ -652,6 +692,7 @@ namespace IngameScript
                             _state = ApState.Fault;
                             _wantEngage = false;
                             _pendingGoto = false;
+                            RetireRoute();
                             Runtime.UpdateFrequency = UpdateFrequency.Update100;
                             return;
                         }
@@ -668,6 +709,7 @@ namespace IngameScript
                             _ship.ClearOverrides();
                             _state = ApState.Fault;
                             _wantEngage = false;
+                            RetireRoute();
                             Runtime.UpdateFrequency = UpdateFrequency.Update100;
                             return;
                         }
@@ -686,6 +728,7 @@ namespace IngameScript
                         _ship.ClearOverrides();
                         _state = ApState.Fault;
                         _wantEngage = false;
+                        RetireRoute();
                         Runtime.UpdateFrequency = UpdateFrequency.Update100;
                         return;
                     }
@@ -712,6 +755,7 @@ namespace IngameScript
                     _ship.ClearOverrides();
                     _state = ApState.Fault;
                     _wantEngage = false;
+                    RetireRoute();
                     Runtime.UpdateFrequency = UpdateFrequency.Update100;
                     return;
                 }
@@ -725,6 +769,13 @@ namespace IngameScript
                     // and the following leg is silently swallowed -- the caller sets the flag,
                     // nothing happens, and no fault is reported.
                     _wantEngage = false;
+                    // Same mirror for the route text: a completed route is not a standing order.
+                    // Left set, a follow-up FB_TargetCoord + FB_Engage=true that never touches
+                    // FB_Route round-trips this same text back unread, and ParseCustomData's engage
+                    // handler prefers a non-empty route over the fresh target -- silently re-flying
+                    // (or, since the ship is already sitting at its endpoint, trivially re-completing)
+                    // the leg that just finished instead of going to the new one. See RetireRoute.
+                    RetireRoute();
                     Runtime.UpdateFrequency = UpdateFrequency.Update100;
                 }
                 return;
@@ -851,8 +902,11 @@ namespace IngameScript
                                 // Edge-triggered on the text: the reference is captured as a
                                 // DIRECTION from wherever the ship was when it was set, so
                                 // re-resolving it every poll would let it drift as the ship moves.
+                                // Same frozen-state trap as the `rollref` argument: skip while cold
+                                // rather than resolve against Body.Position == Vector3D.Zero. _rollRefText
+                                // is left unset so this retries every poll until state is live.
                                 Vector3D rc;
-                                if (TryParseDestination(rr, out rc))
+                                if (_ship.StateValid && TryParseDestination(rr, out rc))
                                 {
                                     Vector3D d = rc - _ship.Body.Position;
                                     if (d.LengthSquared() >= 1.0)

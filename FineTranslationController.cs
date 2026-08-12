@@ -66,7 +66,12 @@ namespace IngameScript
             public static double DefaultArrivalDistM = 40.0;
             public double ArrivalDistM = DefaultArrivalDistM;
             // Let-go radius for the already-arrived fast-path.
-            public double FastArriveDistM = 25.0;
+            // Fast-path arrival radius, taken while merely "slow" -- so it, not ArrivalDistM, is what
+            // usually ends a leg. It was hardcoded, which made the arrivaldist knob look inert: every
+            // arrival landed at 25-39 m however tight ArrivalDistM was set. Static default so a host
+            // can tune it the same way it tunes ArrivalDistM.
+            public static double DefaultFastArriveDistM = 25.0;
+            public double FastArriveDistM = DefaultFastArriveDistM;
 
             // Re-base bound.
             public int MaxRebases = 3;
@@ -338,7 +343,10 @@ namespace IngameScript
                             // also BRAKE on; where it is infeasible, re-base into the hop instead.
                             StartPosition = pos;
                             Vector3D residual = Target - pos;
-                            if (EstimateTranslateTime(residual) < 1e8)
+                            // Inside CloseTranslateM the intent is flip-free, period: never re-base
+                            // into a hop there even if the estimate calls translate infeasible -- a
+                            // flip this close arrives hot and off-line.
+                            if (EstimateTranslateTime(residual) < 1e8 || distToTarget < CloseTranslateM)
                                 EnterTranslate(pos);
                             else
                             {
