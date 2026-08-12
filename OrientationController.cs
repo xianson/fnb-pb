@@ -73,6 +73,10 @@ namespace IngameScript
             // 20 measured better than 10 and far better than 0 on MUNDOZER (settled omega RMS
             // 0.051 / 0.087 / 0.280, gyro saturated 0% / 1% / 64% of samples).
             public static double HandoffAngleDeg = 20.0;
+            // Endgame pace, as a fraction of the hand-off angle. See the tau derivation. 1.0 is the
+            // original behaviour exactly; lower is faster near the setpoint. A TUNING value -- there
+            // is no derivation for how far below min-time a damped endgame has to sit.
+            public static double EndgamePaceFrac = 1.0;
             // Shortest time the law is allowed to plan for reaching the rate cap. Bounds commanded
             // angular acceleration on hulls whose authority far exceeds what a 60 Hz loop can meter.
             // 0 disables the bound.
@@ -517,7 +521,39 @@ namespace IngameScript
                         double aU;
                         if (angleRad < handoffRad && handoffRad > 1e-6)
                         {
-                            double tau = Math.Sqrt(2.0 * handoffRad / Math.Max(1e-6, alphaCmd));
+                            // EVALUATE tau AT THE ANGLE BEING CLOSED, not at the hand-off angle.
+                            //
+                            // The intent above -- "the same natural pace as the slew it follows" -- is
+                            // right, but freezing tau at the hand-off makes the endgame run a 20 deg
+                            // response for the whole descent, so it crawls at 4 deg and crawls ten
+                            // times slower at 1. Measured on SUNDIAL (alphaCmd 0.729): tau =
+                            // sqrt(2*0.349/0.729) = 0.978 s, so at 4.2 deg with v ~ 0 the demand is
+                            // 0.0733/0.978^2 = 0.0766 rad/s^2 -- 11% of available authority, and the
+                            // trace shows exactly that, parked at ang 4.2 for the better part of a
+                            // second.
+                            //
+                            // Using the live angle keeps the same min-time relation and is continuous
+                            // at the boundary (angleRad == handoffRad reproduces the old value
+                            // exactly). It is also self-limiting rather than divergent: as the angle
+                            // shrinks, tau^2 = 2*theta/alpha, so theta/tau^2 -> alphaCmd/2 and the
+                            // demand approaches half authority instead of vanishing.
+                            // ...BUT NOT AT MIN-TIME PACE. tau^2 = 2*theta/alpha makes theta/tau^2
+                            // exactly alphaCmd/2 at EVERY angle, so the endgame demands half
+                            // authority however small the error is. That is min-time pace, and a
+                            // critically damped law run at min-time pace has no margin -- which is
+                            // the chatter this branch exists to avoid. Flown: sluggish at 1.0,
+                            // wobbly at 0.0.
+                            //
+                            // "Slower than min-time, by how much" has no derivation. It is a free
+                            // parameter, so it is ONE knob, named, rather than a constant buried in
+                            // an expression. It floors the angle tau is evaluated at:
+                            //   1.0 -> the hand-off angle always: the original, safe, slow near zero
+                            //   0.0 -> the live angle: min-time pace, fastest, chatters
+                            // Values in between fix the pace below EndgamePaceFrac*handoff and let it
+                            // track the angle above that.
+                            double tauRad = Math.Max(angleRad, EndgamePaceFrac * handoffRad);
+                            if (tauRad < 1e-9) tauRad = 1e-9;
+                            double tau = Math.Sqrt(2.0 * tauRad / Math.Max(1e-6, alphaCmd));
                             if (tau < 4.0 * h) tau = 4.0 * h;      // never faster than the loop can act
                             aU = (2.0 / tau) * v + angleRad / (tau * tau);
                         }
