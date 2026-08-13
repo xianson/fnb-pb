@@ -208,7 +208,16 @@ namespace IngameScript
             // axis is rewritten every tick as omegaBody moves. That is the "very high oscillation on
             // the flip axes" seen on the server -- and it is why the Pickaxe (alpha 0.88, far below
             // the cliff) flew this same code perfectly.
-            public static bool ServoRampFrames = true;
+            // DEFAULTS TO THE PLUGIN, which is what actually flies now. It used to default true --
+            // the PB's gyro-override servo -- and rely on PluginShip's constructor to correct it.
+            // Statics reset on every hot reload, so any path where attitude ran before that
+            // constructor silently restored a 26-120x inflated rate gap (81x on MUNDOZER yaw), which
+            // does not merely saturate the command but rewrites the commanded rotation axis every
+            // tick. Defaulting to the consumer that no longer exists put the worst attitude bug of
+            // the day one construction-order change away from returning.
+            //
+            // A PB host must now set this true for itself; the knob stays for that and for A/B.
+            public static bool ServoRampFrames = false;
             // Engine tick (s). Fixed by SE physics; AccelToRateGap inverts a 60 Hz servo ramp.
             public const double TickSeconds = 1.0 / 60.0;
             // PB DEVIATION: in the mod the law ran every engine tick, so the zero-order hold and the
